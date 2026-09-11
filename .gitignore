@@ -1,0 +1,4 @@
+/whichtests
+/dist/
+*.out
+selection.json
