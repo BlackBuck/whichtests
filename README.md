@@ -240,11 +240,32 @@ Progress over the same 25 merges, as each fallback was narrowed:
 | baseline | 95.0% | 100% | 20 / 25 |
 | + ignore docs and assets | 80.0% | 100% | 17 / 25 |
 | + resolve declarations | 75.7% | 100% | 17 / 25 |
-| + narrow dependency bumps | **61.0%** | **84.0%** | **11 / 25** |
+| + narrow dependency bumps | 61.0% | 84.0% | 11 / 25 |
+| + attribute files to their package | **17.3%** | **2.2%** | **0 / 25** |
 
-Across all 25 commits that is 32,405 tests selected down to 26,087 — **19.5%
-fewer** — and the median finally moved off 100%. The distribution stays
-bimodal: p25 is 9%, p75 is still 100%.
+Across all 25 commits that is 32,405 tests selected down to **7,423**, and no
+commit escalates to a full run any more.
+
+The last step was the one that mattered, and it was fixing actively harmful
+behaviour rather than adding cleverness. A file the analysis did not recognise
+used to run the whole suite. But a `.github/workflows/*.yml` edit changes no Go
+input at all, so `go test` re-runs *nothing* while whichtests ran all 1715 —
+far worse than doing nothing. Seven of these 25 merges touch no Go file
+whatsoever and now correctly select zero tests.
+
+The general rule is ownership: a file inside a package's directory can only
+affect that package and its dependents. `acceptance/testdata/pr.txtar` cannot
+change what `pkg/cmd/issue` does. If the owning package was never analyzed —
+typically because it sits behind a build tag — then no test we know about can
+be affected, so there is nothing to select.
+
+That last clause is a real limitation worth stating plainly: whichtests only
+selects among tests it analyzed. Commit `9b6585be` rewrites 845 lines of
+`acceptance/acceptance_test.go`, and whichtests reports 4 tests, because the
+acceptance suite is behind a build tag and is not in the analyzed set at all.
+That is correct for the suite being selected from, and useless if you expected
+the acceptance tests to be covered. Analyze with the build tag if you need
+them.
 
 ### Dependency bumps narrow to their importers
 

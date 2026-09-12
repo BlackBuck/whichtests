@@ -4,9 +4,11 @@ package selection
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/BlackBuck/whichtests/internal/gitdiff"
 	"github.com/BlackBuck/whichtests/internal/graph"
@@ -86,6 +88,69 @@ func modulePackages(g *graph.Graph, mods []string) map[string]bool {
 	return affected
 }
 
+// fileOwner reports which package's directory tree a file sits in.
+//
+// A file inside a package's directory can only affect that package and its
+// dependents -- `acceptance/testdata/pr.txtar` cannot change what
+// `pkg/cmd/issue` does. If the owning package was never analyzed, typically
+// because it sits behind a build tag, then no test we know about can be
+// affected by it either, so there is nothing to select.
+type owner int
+
+const (
+	ownerUnknown  owner = iota // escalate: the file belongs to nothing we know
+	ownerLoaded                // mark the owning package dirty
+	ownerUnloaded              // ignore: the owning package is not in the analysis
+)
+
+func fileOwner(g *graph.Graph, dirPkg map[string]string, file string) (string, owner) {
+	dir := filepath.Dir(file)
+	for {
+		if pkg, ok := dirPkg[dir]; ok {
+			return pkg, ownerLoaded
+		}
+		if hasGoFiles(dir) {
+			return "", ownerUnloaded
+		}
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return "", ownerUnknown // reached a module root without an owner
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir || parent == "" {
+			return "", ownerUnknown
+		}
+		dir = parent
+	}
+}
+
+var goDirCache sync.Map // dir -> bool
+
+func hasGoFiles(dir string) bool {
+	if v, ok := goDirCache.Load(dir); ok {
+		return v.(bool)
+	}
+	found := false
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+				found = true
+				break
+			}
+		}
+	}
+	goDirCache.Store(dir, found)
+	return found
+}
+
+// dirIndex maps each directory holding analyzed source to its import path.
+func dirIndex(g *graph.Graph) map[string]string {
+	out := make(map[string]string, len(g.FilePkg))
+	for file, pkg := range g.FilePkg {
+		out[filepath.Dir(file)] = pkg
+	}
+	return out
+}
+
 // resolveDecl maps a hunk that missed every function body to the functions that
 // reference the declaration it landed on.
 //
@@ -134,9 +199,19 @@ func declLabel(g *graph.Graph, h gitdiff.Hunk) string {
 //     attributes them to the package that embeds them, so changing an embedded
 //     README marks that package dirty instead.
 func nonBehavioral(path string) bool {
-	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+	segs := strings.Split(filepath.ToSlash(path), "/")
+	for _, seg := range segs {
 		if seg == "testdata" || seg == "fixtures" || seg == "golden" {
 			return false
+		}
+	}
+	// Anything under .github configures CI and the forge, not the test suite.
+	// Escalating here was the tool's worst behaviour: a workflow edit changes
+	// no Go input, so `go test` re-runs nothing at all while whichtests ran the
+	// entire suite.
+	for i, seg := range segs {
+		if seg == ".github" && i < len(segs)-1 {
+			return true
 		}
 	}
 	switch strings.ToLower(filepath.Ext(path)) {
@@ -176,6 +251,7 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	unresolved := make(map[string]bool)
 	ignored := make(map[string]bool)
 	resolved := make(map[string]bool)
+	dirs := dirIndex(g)
 
 	for _, h := range hunks {
 		// go.mod and go.sum are handled through the module path below, not as
@@ -190,7 +266,16 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 				ignored[h.File] = true
 				continue
 			}
-			unresolved[h.File] = true
+			switch pkg, own := fileOwner(g, dirs, h.File); own {
+			case ownerLoaded:
+				// testdata, a golden file, or a generated artefact belonging to
+				// a package we analyzed.
+				dirtyPkgs[pkg] = true
+			case ownerUnloaded:
+				ignored[h.File] = true
+			default:
+				unresolved[h.File] = true
+			}
 			continue
 		}
 		var hit bool

@@ -1,6 +1,8 @@
 package selection
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/BlackBuck/whichtests/internal/gitdiff"
@@ -137,8 +139,15 @@ func TestNonBehavioral(t *testing.T) {
 		{"/r/pkg/fixtures/out.png", false},
 		{"/r/go.mod", false},
 		{"/r/go.sum", false},
+		// A script outside .github might be executed by a test, so it still
+		// escalates.
 		{"/r/script/build.sh", false},
-		{"/r/.github/workflows/ci.yml", false},
+		// CI config changes no Go input: `go test` re-runs nothing, so
+		// escalating here made the tool far worse than doing nothing.
+		{"/r/.github/workflows/ci.yml", true},
+		{"/r/.github/workflows/scripts/bump-go.sh", true},
+		// ...unless it is fixture data a test reads.
+		{"/r/.github/testdata/golden.yml", false},
 		{"/r/acceptance/repo.txtar", false},
 	}
 	for _, c := range cases {
@@ -292,4 +301,82 @@ func TestModuleWildcardEscalates(t *testing.T) {
 	if !res.Conservative {
 		t.Error("a toolchain bump must run everything")
 	}
+}
+
+func TestFileOwnership(t *testing.T) {
+	// A real tree: package "a" has source and a testdata dir; "unloaded" holds
+	// Go files that were never analyzed (build tags); "docs" holds neither.
+	root := t.TempDir()
+	mk := func(p string, isGo bool) string {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := "data"
+		if isGo {
+			body = "package x"
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return full
+	}
+	aGo := mk("a/a.go", true)
+	fixture := mk("a/testdata/golden.txt", false)
+	mk("unloaded/u.go", true)
+	tagged := mk("unloaded/testdata/case.txtar", false)
+	orphan := mk("docs/notes.org", false)
+	mk("go.mod", false)
+
+	g := &graph.Graph{FilePkg: map[string]string{aGo: "a"}}
+	dirs := dirIndex(g)
+
+	for _, tc := range []struct {
+		name string
+		file string
+		pkg  string
+		want owner
+	}{
+		{"testdata belongs to its package", fixture, "a", ownerLoaded},
+		{"source file's own package", aGo, "a", ownerLoaded},
+		{"fixture of an unanalyzed package", tagged, "", ownerUnloaded},
+		{"file owned by nothing", orphan, "", ownerUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pkg, own := fileOwner(g, dirs, tc.file)
+			if own != tc.want || pkg != tc.pkg {
+				t.Errorf("fileOwner(%s) = (%q,%v), want (%q,%v)", tc.file, pkg, own, tc.pkg, tc.want)
+			}
+		})
+	}
+}
+
+func TestTestdataSelectsOwningPackageNotEverything(t *testing.T) {
+	root := t.TempDir()
+	aGo := filepath.Join(root, "a", "a.go")
+	os.MkdirAll(filepath.Dir(aGo), 0o755)
+	os.WriteFile(aGo, []byte("package a"), 0o644)
+	fixture := filepath.Join(root, "a", "testdata", "golden.txtar")
+	os.MkdirAll(filepath.Dir(fixture), 0o755)
+	os.WriteFile(fixture, []byte("data"), 0o644)
+	os.WriteFile(filepath.Join(root, "go.mod"), []byte("module m"), 0o644)
+
+	g := fixture2(aGo)
+	res := Select(g, []gitdiff.Hunk{{File: fixture, StartLine: 1, EndLine: 1}},
+		Options{ConservativeOnUnresolved: true})
+
+	if res.Conservative {
+		t.Fatal("a fixture change must not run the whole suite")
+	}
+	if len(res.DirtyPackages) != 1 || res.DirtyPackages[0] != "a" {
+		t.Fatalf("DirtyPackages = %v, want [a]", res.DirtyPackages)
+	}
+}
+
+// fixture2 is the shared fixture with package "a" rooted at a real file.
+func fixture2(aGo string) *graph.Graph {
+	g := fixture()
+	g.FilePkg = map[string]string{aGo: "a"}
+	g.Spans = map[string][]graph.FuncSpan{}
+	return g
 }
