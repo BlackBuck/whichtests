@@ -1,0 +1,26 @@
+# Dogfood: run this repository's own tests through its own action.
+#
+# The tool's value is near zero here -- four small packages -- so this exists to
+# prove the action works end to end, not to save time.
+name: selective-tests
+
+on: [push, pull_request]
+
+jobs:
+  selective:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # whichtests needs history to find the merge base. Without this the
+          # action fails fast rather than silently testing nothing.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - id: whichtests
+        uses: ./
+        with:
+          version: local
+      - run: |
+          echo "selected ${{ steps.whichtests.outputs.selected }} of ${{ steps.whichtests.outputs.total }}"

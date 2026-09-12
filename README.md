@@ -173,8 +173,29 @@ whichtests doctor [-C dir] [-fat N]
                    report tests-per-package and whether this repo has headroom
 ```
 
+### GitHub Action
+
 ```yaml
-# in CI
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0        # required: the merge base needs history
+- uses: actions/setup-go@v5
+  with: { go-version: '1.24' }
+- uses: BlackBuck/whichtests@v1
+```
+
+It fetches the base branch, selects, and runs only what it selected, writing
+the count to the job summary. Inputs: `base`, `working-directory`, `tags`,
+`run`, `safe`, `version`. Outputs: `selected`, `total`, `plan`, `json`.
+
+`fetch-depth: 0` is not optional. `actions/checkout` defaults to a shallow
+clone, which leaves no merge base, which makes the diff come back empty — a
+selective run would then test nothing and report success. The action checks for
+this and fails rather than letting it pass.
+
+Or drive it yourself:
+
+```yaml
 - run: whichtests -base origin/${{ github.base_ref }} -format go-test | sh
 ```
 

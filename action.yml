@@ -1,0 +1,149 @@
+name: whichtests
+description: Run only the Go tests a diff can actually affect.
+author: BlackBuck
+
+inputs:
+  base:
+    description: >-
+      Git ref to diff against. Defaults to the pull request's base branch, or
+      the default branch on a push.
+    required: false
+    default: ""
+  working-directory:
+    description: Module directory to analyze.
+    required: false
+    default: "."
+  tags:
+    description: >-
+      Comma-separated build tags. Must match the tags the tests will run with;
+      nothing verifies that for you.
+    required: false
+    default: ""
+  run:
+    description: Run the selected tests. Set to false to only produce the plan.
+    required: false
+    default: "true"
+  safe:
+    description: >-
+      Run everything when the diff touches a file the analysis does not
+      recognise. Turning this off trades recall for speed.
+    required: false
+    default: "true"
+  version:
+    description: >-
+      Version of whichtests to install. Use "local" to build from the checked
+      out source instead, which is how this repository tests its own action.
+    required: false
+    default: latest
+
+outputs:
+  selected:
+    description: Number of tests selected.
+    value: ${{ steps.select.outputs.selected }}
+  total:
+    description: Number of tests in the suite.
+    value: ${{ steps.select.outputs.total }}
+  plan:
+    description: Path to a shell script running the selected tests.
+    value: ${{ steps.select.outputs.plan }}
+  json:
+    description: Path to the full selection as JSON.
+    value: ${{ steps.select.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the checkout has history
+      shell: bash
+      run: |
+        set -euo pipefail
+        # This is the failure that matters. actions/checkout defaults to
+        # fetch-depth 1, so there is no merge base, the diff comes back empty,
+        # and a selective run would quietly test nothing while reporting
+        # success. Fail loudly instead.
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "::error::whichtests needs history to find the merge base." \
+               "Set 'fetch-depth: 0' on actions/checkout."
+          exit 1
+        fi
+
+    - name: Install whichtests
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v go >/dev/null; then
+          echo "::error::Go is not on PATH. Run actions/setup-go before this action."
+          exit 1
+        fi
+        if [ "${{ inputs.version }}" = "local" ]; then
+          go build -o "$RUNNER_TEMP/whichtests" ./cmd/whichtests
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+        else
+          go install "github.com/BlackBuck/whichtests/cmd/whichtests@${{ inputs.version }}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Select tests
+      id: select
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_TAGS: ${{ inputs.tags }}
+        INPUT_SAFE: ${{ inputs.safe }}
+        PR_BASE: ${{ github.event.pull_request.base.ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+
+        base="$INPUT_BASE"
+        if [ -z "$base" ]; then
+          base="${PR_BASE:-$DEFAULT_BRANCH}"
+        fi
+        # The base branch is usually not checked out locally, so the merge base
+        # cannot be computed until it is fetched.
+        git fetch --quiet origin "$base" || true
+        if git rev-parse --verify --quiet "origin/$base" >/dev/null; then
+          base="origin/$base"
+        fi
+        echo "diffing against $base"
+
+        args=(-base "$base" -safe="$INPUT_SAFE")
+        if [ -n "$INPUT_TAGS" ]; then args+=(-tags "$INPUT_TAGS"); fi
+
+        json="$RUNNER_TEMP/whichtests.json"
+        plan="$RUNNER_TEMP/whichtests-plan.sh"
+        whichtests "${args[@]}" -format json > "$json"
+
+        selected=$(jq -r '.selected' "$json")
+        total=$(jq -r '.total' "$json")
+        jq -r '.plans[]? | "go test -run \(.run|@sh) \(.package)"' "$json" > "$plan"
+
+        {
+          echo "selected=$selected"
+          echo "total=$total"
+          echo "plan=$plan"
+          echo "json=$json"
+        } >> "$GITHUB_OUTPUT"
+
+        pct=$(awk -v s="$selected" -v t="$total" 'BEGIN{ if (t>0) printf "%.1f", 100*s/t; else print "0.0" }')
+        echo "### whichtests: $selected of $total tests ($pct%)" >> "$GITHUB_STEP_SUMMARY"
+        if [ "$(jq -r '.conservative' "$json")" = "true" ]; then
+          echo "Selection was conservative: the diff touched files the analysis does not recognise." \
+            >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Run selected tests
+      if: inputs.run == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        plan="${{ steps.select.outputs.plan }}"
+        if [ ! -s "$plan" ]; then
+          echo "no tests selected; nothing to run"
+          exit 0
+        fi
+        cat "$plan"
+        # Every command in the plan must pass, and an empty plan is a pass.
+        bash -e "$plan"
