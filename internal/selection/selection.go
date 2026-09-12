@@ -345,23 +345,26 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 		reaching = g.Reaching(changed)
 	}
 
-	// Distrust a total zero, and only a total zero. If the walk found nothing
-	// but ran into functions that nothing calls, reachability is unknown rather
-	// than empty -- something dispatches to them reflectively -- so fall back
-	// to those functions' packages.
+	// Where the walk runs into a function nothing calls, reachability there is
+	// unknown rather than empty: something dispatches to it reflectively.
 	//
-	// Gating on zero matters. Falling back whenever the walk meets any orphan
-	// selected 72.8% more tests across 25 cli/cli merges, taking one commit
-	// from 22 tests to 1185: orphans are common, and most walks pass one
-	// without the answer being wrong. A diff that reaches some tests statically
-	// and others only reflectively is still under-selected; that is the
-	// residual reflection gap, not something this closes.
-	if len(changed) > 0 && len(reaching) == 0 {
-		for _, key := range g.Boundaries(changed) {
-			if pkg := g.KeyPackage(key); pkg != "" {
-				dirtyPkgs[pkg] = true
-				orphans[key] = true
-			}
+	// Only boundaries in a package the diff actually touched count. That is
+	// what makes this affordable: applying every boundary the walk meets
+	// selected 72.8% more tests across 25 cli/cli merges, because walks pass
+	// through orphans in unrelated packages constantly. Both real violations
+	// found so far had the boundary sitting in the changed symbol's own
+	// package -- cmdutil's reflective ExportData, and the pointer-receiver
+	// wrapper for gin's H.MarshalXML.
+	changedPkgs := make(map[string]bool, len(changed))
+	for key := range changed {
+		if pkg := g.KeyPackage(key); pkg != "" {
+			changedPkgs[pkg] = true
+		}
+	}
+	for _, key := range g.Boundaries(changed) {
+		if pkg := g.KeyPackage(key); changedPkgs[pkg] {
+			dirtyPkgs[pkg] = true
+			orphans[key] = true
 		}
 	}
 	res.DirtyPackages = sortedKeys(dirtyPkgs)
