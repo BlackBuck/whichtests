@@ -47,6 +47,43 @@ type Result struct {
 	// ResolvedDecls are declaration changes that were resolved to their
 	// referencing functions instead of marking the whole package dirty.
 	ResolvedDecls []string
+	// ChangedModules are the dependencies a go.mod/go.sum change touched.
+	ChangedModules []string
+}
+
+// modulePackages returns the packages that import something from one of the
+// changed modules, directly or transitively.
+//
+// A dependency bump can change anything, but "anything" is bounded by what
+// imports it: bumping a tunnelling library used by one command cannot break an
+// unrelated command's tests. Prefix matching is on module path boundaries, so
+// "golang.org/x/sys" never matches "golang.org/x/systemd".
+func modulePackages(g *graph.Graph, mods []string) map[string]bool {
+	if len(mods) == 0 {
+		return nil
+	}
+	inMod := func(pkg string) bool {
+		for _, m := range mods {
+			if pkg == m || strings.HasPrefix(pkg, m+"/") {
+				return true
+			}
+		}
+		return false
+	}
+	affected := make(map[string]bool)
+	for pkg, deps := range g.PkgDeps {
+		if inMod(pkg) {
+			affected[pkg] = true
+			continue
+		}
+		for d := range deps {
+			if inMod(d) {
+				affected[pkg] = true
+				break
+			}
+		}
+	}
+	return affected
 }
 
 // resolveDecl maps a hunk that missed every function body to the functions that
@@ -126,6 +163,8 @@ type Options struct {
 	// IncludeNonBehavioral disables the documentation/asset filter, so every
 	// unresolved file escalates. Use it to audit what the filter is skipping.
 	IncludeNonBehavioral bool
+	// Modules describes what the diff did to go.mod and go.sum.
+	Modules gitdiff.ModuleChange
 }
 
 // Select maps hunks to symbols and symbols to tests.
@@ -139,6 +178,11 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	resolved := make(map[string]bool)
 
 	for _, h := range hunks {
+		// go.mod and go.sum are handled through the module path below, not as
+		// unresolved files.
+		if base := filepath.Base(h.File); base == "go.mod" || base == "go.sum" {
+			continue
+		}
 		spans, known := g.Spans[h.File]
 		pkg, inPkg := g.FilePkg[h.File]
 		if !known && !inPkg {
@@ -179,6 +223,14 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	res.UnresolvedFiles = sortedKeys(unresolved)
 	res.IgnoredFiles = sortedKeys(ignored)
 	res.ResolvedDecls = sortedKeys(resolved)
+	res.ChangedModules = opts.Modules.Modules
+
+	// A go/toolchain directive bump, or requirement lines we could not parse,
+	// leaves nothing safe to skip.
+	modAffected := modulePackages(g, opts.Modules.Modules)
+	if opts.Modules.Touched && (opts.Modules.Wildcard || len(modAffected) == 0) {
+		unresolved["go.mod"] = true
+	}
 
 	if opts.Conservative || (opts.ConservativeOnUnresolved && len(unresolved) > 0) {
 		res.Conservative = true
@@ -198,7 +250,7 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	}
 
 	for _, t := range g.Tests {
-		if r, ok := match(t, changed, dirtyPkgs, g.PkgDeps[t.PkgPath]); ok {
+		if r, ok := match(t, changed, dirtyPkgs, modAffected, g.PkgDeps[t.PkgPath]); ok {
 			res.Selected = append(res.Selected, Selected{PkgPath: t.PkgPath, Name: t.Name, Reason: r})
 		}
 	}
@@ -206,7 +258,7 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	return res
 }
 
-func match(t *graph.Test, changed, dirty map[string]bool, deps map[string]bool) (Reason, bool) {
+func match(t *graph.Test, changed, dirty, modAffected map[string]bool, deps map[string]bool) (Reason, bool) {
 	for key := range t.Reach {
 		if changed[key] {
 			return Reason{Kind: "symbol", Detail: key}, true
@@ -218,6 +270,14 @@ func match(t *graph.Test, changed, dirty map[string]bool, deps map[string]bool) 
 	for d := range dirty {
 		if deps[d] {
 			return Reason{Kind: "package", Detail: d}, true
+		}
+	}
+	if modAffected[t.PkgPath] {
+		return Reason{Kind: "module", Detail: t.PkgPath}, true
+	}
+	for d := range deps {
+		if modAffected[d] {
+			return Reason{Kind: "module", Detail: d}, true
 		}
 	}
 	return Reason{}, false

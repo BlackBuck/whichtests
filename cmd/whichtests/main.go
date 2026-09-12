@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/BlackBuck/whichtests/internal/gitdiff"
@@ -49,11 +50,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	mods, err := gitdiff.Modules(*dir, *base)
+	if err != nil {
+		return err
+	}
 
 	res := selection.Select(g, hunks, selection.Options{
 		Conservative:             *conservative,
 		ConservativeOnUnresolved: *safe,
 		IncludeNonBehavioral:     *includeND,
+		Modules:                  mods,
 	})
 
 	switch *format {
@@ -91,6 +97,10 @@ func emitText(r *selection.Result, explain bool, took time.Duration) error {
 	fmt.Printf("%d of %d tests selected (%.1f%%) in %s\n", len(r.Selected), r.Total, pct, took.Round(time.Millisecond))
 	fmt.Printf("%d symbol(s) changed, %d package(s) dirty at package level\n",
 		len(r.ChangedSymbols), len(r.DirtyPackages))
+	if len(r.ChangedModules) > 0 {
+		fmt.Printf("%d dependency module(s) changed: %s\n",
+			len(r.ChangedModules), strings.Join(truncList(r.ChangedModules, 4), ", "))
+	}
 	if len(r.ResolvedDecls) > 0 {
 		fmt.Printf("%d declaration(s) resolved to referencing functions instead of dirtying a package\n",
 			len(r.ResolvedDecls))
@@ -108,6 +118,14 @@ func emitText(r *selection.Result, explain bool, took time.Duration) error {
 		}
 	}
 	return nil
+}
+
+// truncList keeps a summary line short without hiding the count.
+func truncList(xs []string, n int) []string {
+	if len(xs) <= n {
+		return xs
+	}
+	return append(append([]string{}, xs[:n]...), fmt.Sprintf("and %d more", len(xs)-n))
 }
 
 func emitGoTest(r *selection.Result) error {

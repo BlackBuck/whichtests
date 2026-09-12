@@ -228,3 +228,68 @@ func TestSelectFallsBackOutsideAnyDeclaration(t *testing.T) {
 		t.Fatalf("expected the package dirty, got %v", res.DirtyPackages)
 	}
 }
+
+func TestModuleNarrowing(t *testing.T) {
+	g := fixture()
+	// Package "a" imports a package from example.com/dep; package "b" does not
+	// import it directly but depends on "a", so it inherits the exposure.
+	g.PkgDeps = map[string]map[string]bool{
+		"a": {"example.com/dep/sub": true},
+		"b": {"a": true, "example.com/dep/sub": true},
+		"c": {"example.com/other": true},
+	}
+	g.Tests = append(g.Tests, &graph.Test{
+		Name: "TestC", PkgPath: "c", Reach: map[string]bool{"c.TestC": true},
+	})
+
+	opts := Options{Modules: gitdiff.ModuleChange{
+		Touched: true,
+		Modules: []string{"example.com/dep"},
+	}}
+	res := Select(g, nil, opts)
+	got := names(res)
+	want := []string{"a.TestBar", "a.TestFoo", "b.TestB"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+	if res.Conservative {
+		t.Error("a targeted dependency bump should not escalate")
+	}
+}
+
+func TestModuleNarrowingPrefixBoundary(t *testing.T) {
+	// "golang.org/x/sys" must not match "golang.org/x/systemd".
+	g := fixture()
+	g.PkgDeps = map[string]map[string]bool{
+		"a": {"golang.org/x/systemd/unit": true},
+		"b": {"golang.org/x/sys/unix": true},
+	}
+	res := Select(g, nil, Options{Modules: gitdiff.ModuleChange{
+		Touched: true, Modules: []string{"golang.org/x/sys"},
+	}})
+	for _, s := range res.Selected {
+		if s.PkgPath == "a" {
+			t.Errorf("golang.org/x/systemd wrongly matched golang.org/x/sys")
+		}
+	}
+	if len(res.Selected) == 0 {
+		t.Error("package b imports golang.org/x/sys and should be selected")
+	}
+}
+
+func TestModuleWildcardEscalates(t *testing.T) {
+	// A `go` directive bump cannot be attributed to importers.
+	g := fixture()
+	res := Select(g, nil, Options{
+		ConservativeOnUnresolved: true,
+		Modules:                  gitdiff.ModuleChange{Touched: true, Wildcard: true},
+	})
+	if !res.Conservative {
+		t.Error("a toolchain bump must run everything")
+	}
+}

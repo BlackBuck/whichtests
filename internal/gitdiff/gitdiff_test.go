@@ -65,3 +65,36 @@ func TestParseSkipsDeletedFiles(t *testing.T) {
 		t.Fatalf("got %d hunks, want 0", len(hunks))
 	}
 }
+
+func TestModuleOfLine(t *testing.T) {
+	cases := []struct {
+		line string
+		mod  string
+		ok   bool
+	}{
+		// go.mod requirement lines, bare and inside a require block.
+		{"require github.com/foo/bar v1.2.3", "github.com/foo/bar", true},
+		{"\tgithub.com/foo/bar v1.2.3", "github.com/foo/bar", true},
+		{"\tgolang.org/x/sys v0.48.0 // indirect", "golang.org/x/sys", true},
+		{"replace example.com/a v1.0.0 => example.com/b v1.1.0", "example.com/a", true},
+		// go.sum lines, both the archive and the go.mod hash.
+		{"github.com/foo/bar v1.2.3 h1:abc=", "github.com/foo/bar", true},
+		{"github.com/foo/bar v1.2.3/go.mod h1:abc=", "github.com/foo/bar", true},
+		// A language or toolchain bump can affect every package, so it must
+		// report ok with an empty module and force the wildcard.
+		{"go 1.24", "", true},
+		{"toolchain go1.24.2", "", true},
+		// Lines carrying no dependency information.
+		{"module github.com/cli/cli/v2", "", false},
+		{"require (", "", false},
+		{")", "", false},
+		{"", "", false},
+		{"// a comment", "", false},
+	}
+	for _, c := range cases {
+		mod, ok := moduleOfLine(c.line)
+		if mod != c.mod || ok != c.ok {
+			t.Errorf("moduleOfLine(%q) = (%q,%v), want (%q,%v)", c.line, mod, ok, c.mod, c.ok)
+		}
+	}
+}

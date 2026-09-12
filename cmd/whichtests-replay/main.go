@@ -137,6 +137,7 @@ func report(s *replay.Summary, verify bool) {
 	fmt.Printf("conservative (ran everything): %d of %d commits (%.1f%%)\n",
 		s.Conservative, s.Replayed, 100*float64(s.Conservative)/float64(s.Replayed))
 	fmt.Printf("declaration changes resolved to functions: %d commit(s)\n", s.DeclResolved)
+	fmt.Printf("dependency bumps narrowed to importers: %d commit(s)\n", s.ModNarrowed)
 
 	if s.Conservative > 0 {
 		fmt.Println()

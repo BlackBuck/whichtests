@@ -221,52 +221,54 @@ $ whichtests-replay -repo ../grafana -n 20 -verify -baseline -json out.json
 
 ```
 replayed 25 commit(s), skipped 0
-selection ratio: mean 80.0%, median 100.0%
-conservative (ran everything): 17 of 25 commits (68.0%)
+selection ratio: mean 61.0%, median 84.0%
+conservative (ran everything): 11 of 25 commits (44.0%)
+declaration changes resolved to functions: 4 commit(s)
+dependency bumps narrowed to importers: 6 commit(s)
 
 what pushed commits onto the conservative path:
-  .mod             6 commit(s)
-  .sum             6 commit(s)
-  .yml             5 commit(s)
-  .sh              4 commit(s)
-  .txtar           4 commit(s)
-  .go              3 commit(s)
+  .txtar          5 commit(s)
+  .yml            5 commit(s)
+  .sh             4 commit(s)
+  .go             3 commit(s)
 ```
 
-### Declaration changes resolve to functions
+Progress over the same 25 merges, as each fallback was narrowed:
 
-A hunk landing outside any function body -- a type, const, var, or interface --
-used to mark the whole package dirty, which is precisely the `go test`
-algorithm. Whenever that fired, the tool was by construction no better than
-doing nothing. cli/cli commit `75fc31e5` adds one line to an interface:
+| | mean | median | conservative |
+|---|---:|---:|---:|
+| baseline | 95.0% | 100% | 20 / 25 |
+| + ignore docs and assets | 80.0% | 100% | 17 / 25 |
+| + resolve declarations | 75.7% | 100% | 17 / 25 |
+| + narrow dependency bumps | **61.0%** | **84.0%** | **11 / 25** |
 
-```go
- type errWithExitCode interface {
-+	error
- 	ExitCode() int
- }
-```
+Across all 25 commits that is 32,405 tests selected down to 26,087 — **19.5%
+fewer** — and the median finally moved off 100%. The distribution stays
+bimodal: p25 is 9%, p75 is still 100%.
 
-`go test` re-runs 205 packages = 1232 tests. whichtests used to select exactly
-1232. It now resolves the declaration to the five functions that reference it:
+### Dependency bumps narrow to their importers
 
-| | Tests |
-|---|---:|
-| `go test ./...` | 1232 |
-| whichtests, package-dirty fallback | 1232 |
-| whichtests, declaration resolution | **872** |
+`go.mod`/`go.sum` churn was the single largest cause of full-suite runs -- 6 of
+17 conservative commits, mostly dependabot. A bump really can change anything,
+but "anything" is bounded by what imports it: a tunnelling library used by one
+command cannot break an unrelated command's tests.
 
-References are collected two ways, and missing either causes under-selection:
-naming the identifier, and *selecting* on it (`v.Bar` reads a struct field
-without ever writing the type's name). A declaration with no recorded
-references still falls back to package-level dirt, because "genuinely unused"
-and "our index missed the uses" are indistinguishable from here.
+The requirement lines are parsed rather than the file's line ranges, because a
+version bump's diff hunk says nothing about which module the line belongs to.
+A `go` or `toolchain` directive still escalates, since a language or toolchain
+change can affect every package.
 
-Honest caveat on the aggregate: over 25 merges this moved the mean from 80.0%
-to 75.7% and fired on only 4 commits. The package-dirty fallback turned out
-*not* to be the dominant one -- the conservative rate stayed at 17 of 25,
-because those escalate on files outside the package graph (`go.mod`, `.yml`,
-`.sh`, `.txtar`, build-tagged `.go`), which this change does nothing about.
+| dependabot bump | before | after |
+|---|---:|---:|
+| `microsoft/dev-tunnels` | 1715 | **95** |
+| two narrow bumps | 1715 | **154** |
+| `yuin/goldmark` | 1715 | **503** |
+| `golang.org/x/sync` | 1715 | 1437 |
+| `golang.org/x/sys` | 1715 | 1629 |
+
+The spread is the point, and it is correct: a leaf dependency collapses to
+almost nothing, while `x/sys` is reachable from nearly everything and barely
+moves.
 
 ### What 25 cli/cli merges actually look like
 
@@ -426,8 +428,11 @@ for RTA on every commit, and the map only changes when the call graph does.
 - [x] Replay harness (`whichtests-replay`) for selection ratio and recall
 - [x] VTA refinement and import-closure filtering
 - [x] Ignore documentation and assets instead of escalating on them
+- [x] Resolve type/const/var changes to their referencing functions
 - [ ] Load build-tag-gated packages (`acceptance/` caused 3 of 25 escalations)
-- [ ] Narrow `go.mod`/`go.sum` escalation using the changed modules' reverse deps
+- [ ] Map `acceptance/*.txtar` fixtures and `script/*.sh` to the packages that
+      read them (`.txtar` and `.sh` now cause 9 of the 11 remaining escalations)
+- [x] Narrow `go.mod`/`go.sum` escalation using the changed modules' reverse deps
 - [ ] Reverse the traversal: walk `callgraph.Node.In` from the changed symbols
       instead of building a reach set per test. The forward BFS is 16.5s of a
       20.8s cli/cli run, and it builds 1714 sets to answer a 2-symbol query.

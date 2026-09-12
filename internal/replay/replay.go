@@ -72,6 +72,7 @@ type CommitResult struct {
 	ChangedSymbols int           `json:"changed_symbols"`
 	DirtyPackages  int           `json:"dirty_packages"`
 	ResolvedDecls  int           `json:"resolved_decls"`
+	ChangedModules int           `json:"changed_modules"`
 	AnalysisTime   time.Duration `json:"analysis_ns"`
 
 	// Unresolved records the files that pushed this commit onto the
@@ -98,6 +99,7 @@ type Summary struct {
 	Conservative int     `json:"conservative_commits"`
 
 	DeclResolved      int `json:"commits_using_decl_resolution"`
+	ModNarrowed       int `json:"commits_using_module_narrowing"`
 	Verified          int `json:"verified_commits"`
 	CommitsWithFailed int `json:"commits_with_failures"`
 	RecallViolations  int `json:"recall_violations"`
@@ -174,11 +176,17 @@ func Run(opts Options) (*Summary, error) {
 			sum.skip(&r, "diff failed: "+err.Error())
 			continue
 		}
+		mods, err := gitdiff.Modules(moduleDir, c.Parent)
+		if err != nil {
+			sum.skip(&r, "go.mod diff failed: "+err.Error())
+			continue
+		}
 		// ConservativeOnUnresolved mirrors the CLI default, so the measured
 		// ratio is the one a real user would actually get.
 		res := selection.Select(g, hunks, selection.Options{
 			ConservativeOnUnresolved: true,
 			IncludeNonBehavioral:     opts.IncludeNonBehavioral,
+			Modules:                  mods,
 		})
 		r.AnalysisTime = time.Since(started)
 		r.Selected = len(res.Selected)
@@ -187,6 +195,7 @@ func Run(opts Options) (*Summary, error) {
 		r.ChangedSymbols = len(res.ChangedSymbols)
 		r.DirtyPackages = len(res.DirtyPackages)
 		r.ResolvedDecls = len(res.ResolvedDecls)
+		r.ChangedModules = len(res.ChangedModules)
 		for _, f := range res.UnresolvedFiles {
 			if rel, err := filepath.Rel(canonWT, f); err == nil {
 				r.Unresolved = append(r.Unresolved, rel)
@@ -352,6 +361,9 @@ func aggregate(s *Summary) {
 		}
 		if r.ResolvedDecls > 0 {
 			s.DeclResolved++
+		}
+		if r.ChangedModules > 0 && !r.Conservative {
+			s.ModNarrowed++
 		}
 		if r.Verified {
 			s.Verified++
