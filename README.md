@@ -55,15 +55,26 @@ nothing. Against that baseline, warm:
 selecting *within* a changed package, and one number caps it:
 
 ```console
-$ for d in $(find . -name '*_test.go' | xargs -n1 dirname | sort -u); do \
-    grep -hcE '^func (Test|Benchmark|Fuzz)[A-Z_]' $d/*_test.go | paste -sd+ - | bc; \
-  done | sort -n | awk '{a[NR]=$1} END {print "packages:",NR," median:",a[int(NR/2)]," max:",a[NR]}'
-packages: 250   median: 4   max: 82
+$ whichtests doctor
+250 packages with tests, 1714 tests total
+tests per package: median 4, mean 6.9, p90 15, max 82
+
+fattest packages (where selecting within a package pays):
+     82  github.com/cli/cli/v2/api
+     78  github.com/cli/cli/v2/internal/config
+     60  github.com/cli/cli/v2/pkg/cmd/extension
+
+32% of tests live in packages of 20 or more.
+
+Verdict: marginal on a warm cache. A minority of your suite is in
+packages big enough to benefit, so the gain depends on where your
+changes land.
 ```
 
-cli/cli: 250 packages, **median 4 tests each**. Nothing to skip, which is
-exactly what 21-vs-22 shows. Go's conventions push toward many small packages,
-so most repositories look like this.
+**Median 4 tests per package.** Nothing to skip, which is exactly what
+21-vs-22 shows. Go's conventions push toward many small packages, so most
+repositories look like this — run `whichtests doctor` on yours before wiring
+anything in.
 
 **Use it when** your CI has no warm cache (persisting `GOCACHE` is the cheaper
 first move — try that first), your suite is slow enough that a 30% cut is worth
@@ -155,6 +166,9 @@ whichtests [flags] [packages]
   -conservative    run everything, unconditionally
   -include-non-behavioral
                    escalate on docs and assets too, to audit what is skipped
+
+whichtests doctor [-C dir] [-fat N]
+                   report tests-per-package and whether this repo has headroom
 ```
 
 ```yaml
@@ -250,8 +264,7 @@ so a moved checkout must miss. 18MB for cli/cli. `-cache=false` disables it,
 
 - [ ] Load build-tag-gated packages
 - [ ] Subtest granularity for non-table-driven `t.Run`
-- [ ] `whichtests doctor`: report tests-per-package so a repo's ceiling is
-      visible in 30 seconds
+- [x] `whichtests doctor`: report a repo's ceiling before anyone wires it in
 - [ ] GitHub Action wrapper
 
 ## Development

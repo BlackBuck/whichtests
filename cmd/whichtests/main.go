@@ -3,6 +3,7 @@
 //	whichtests -base main
 //	whichtests -base main -format go-test | sh
 //	whichtests -base main -format json > selection.json
+//	whichtests doctor
 package main
 
 import (
@@ -19,6 +20,13 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		if err := doctor(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "whichtests doctor:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "whichtests:", err)
 		os.Exit(1)
