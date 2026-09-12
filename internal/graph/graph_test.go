@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -131,5 +132,87 @@ func TestBuildThroughSymlink(t *testing.T) {
 			t.Errorf("%s reaches Normalize = %v, want %v (reached: %v)",
 				tc.test, got, tc.want, reaching)
 		}
+	}
+}
+
+// TestEveryKeyHasAPackage guards the reflection fallback. A synthesised wrapper
+// -- the pointer-receiver shim ssa generates for a value-receiver method -- has
+// a nil Pkg, and those are exactly the functions reflection dispatches to. When
+// they went unattributed the fallback had no package to mark dirty and silently
+// did nothing, so a reflectively-reached change selected zero tests.
+func TestEveryKeyHasAPackage(t *testing.T) {
+	dir, err := filepath.Abs("../../example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Skip("example module not present")
+	}
+	g, err := Build(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing []string
+	for key := range g.keys {
+		if g.KeyPackage(key) != "" {
+			continue
+		}
+		// A method promoted onto an anonymous struct or interface type has no
+		// declaring package and cannot be the target of a source edit, so it
+		// needs no attribution.
+		if strings.Contains(key, "struct{") || strings.Contains(key, "interface{") {
+			continue
+		}
+		missing = append(missing, key)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		show := missing
+		if len(show) > 10 {
+			show = show[:10]
+		}
+		t.Errorf("%d symbol(s) have no package, e.g. %v", len(missing), show)
+	}
+}
+
+func TestBoundaries(t *testing.T) {
+	// entry -> caller -> target, plus reflective -> target where nothing calls
+	// reflective. A walk back from target must report reflective and not entry.
+	g := &Graph{
+		nodeKey: []string{"p.entry", "p.caller", "p.target", "p.reflective", "p.init"},
+		rev: [][]int32{
+			nil,    // entry: a test, handled below
+			{0},    // caller <- entry
+			{1, 3}, // target <- caller, reflective
+			nil,    // reflective <- nothing: this is the boundary
+			nil,    // init: an entry point, never a boundary
+		},
+		byKey: map[string][]int32{
+			"p.entry": {0}, "p.caller": {1}, "p.target": {2},
+			"p.reflective": {3}, "p.init": {4},
+		},
+		keyPkg: map[string]string{
+			"p.entry": "p", "p.caller": "p", "p.target": "p",
+			"p.reflective": "p", "p.init": "p",
+		},
+		testByKey: map[string]*Test{"p.entry": {Name: "TestEntry", PkgPath: "p", Key: "p.entry"}},
+	}
+
+	got := g.Boundaries(map[string]bool{"p.target": true})
+	if len(got) != 1 || got[0] != "p.reflective" {
+		t.Errorf("Boundaries = %v, want [p.reflective]", got)
+	}
+
+	// A test entry has no callers by design and must never be reported.
+	if b := g.Boundaries(map[string]bool{"p.caller": true}); len(b) != 0 {
+		t.Errorf("a walk reaching only a test entry reported %v, want none", b)
+	}
+	// Neither must a package init.
+	if b := g.Boundaries(map[string]bool{"p.init": true}); len(b) != 0 {
+		t.Errorf("init reported as a boundary: %v", b)
+	}
+	// A symbol absent from the graph is dead code, not a boundary.
+	if b := g.Boundaries(map[string]bool{"p.missing": true}); len(b) != 0 {
+		t.Errorf("unknown symbol reported %v, want none", b)
 	}
 }

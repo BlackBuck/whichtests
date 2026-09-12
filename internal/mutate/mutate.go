@@ -29,7 +29,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BlackBuck/whichtests/internal/gitdiff"
 	"github.com/BlackBuck/whichtests/internal/graph"
+	"github.com/BlackBuck/whichtests/internal/selection"
 )
 
 // Candidate is a function that can carry an injected fault.
@@ -213,12 +215,16 @@ func inject(g *graph.Graph, c Candidate, opts Options) Result {
 	// The source must come back even if the test run panics or is interrupted.
 	defer os.WriteFile(c.File, orig, info.Mode())
 
-	// The selection is what whichtests would produce for a change to this
-	// function, taken straight from the reachability map rather than round
-	// tripping through a diff.
-	selected := make(map[string]bool)
-	for t := range g.Reaching(map[string]bool{c.Key: true}) {
-		selected[t.PkgPath+"."+t.Name] = true
+	// Run the real selector over a synthetic hunk on this function, rather
+	// than querying reachability directly. Those are not the same thing: the
+	// selector adds the fallbacks -- reflection boundaries in particular -- and
+	// a harness that measures the internal instead of the product reports
+	// violations the tool does not actually have.
+	hunks := []gitdiff.Hunk{{File: c.File, StartLine: c.Line, EndLine: c.Line}}
+	sel := selection.Select(g, hunks, selection.Options{})
+	selected := make(map[string]bool, len(sel.Selected))
+	for _, s := range sel.Selected {
+		selected[s.PkgPath+"."+s.Name] = true
 	}
 	r.Selected = len(selected)
 
@@ -241,7 +247,13 @@ func inject(g *graph.Graph, c Candidate, opts Options) Result {
 }
 
 func runSuite(dir string, timeout time.Duration) (map[string]bool, error) {
-	cmd := exec.Command("go", "test", "-json", "-count=1", "-timeout", timeout.String(), "./...")
+	// No -count=1, deliberately. Go keys the test cache on the compiled test
+	// binary, so a package the mutant does not affect has identical inputs and
+	// its cached pass is correct; a package it does affect recompiles and
+	// re-runs. Failures are never cached. That makes each mutant cost the
+	// affected packages rather than all 1714 tests, which is the difference
+	// between a hundred mutants and a dozen.
+	cmd := exec.Command("go", "test", "-json", "-timeout", timeout.String(), "./...")
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

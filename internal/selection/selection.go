@@ -51,6 +51,9 @@ type Result struct {
 	ResolvedDecls []string
 	// ChangedModules are the dependencies a go.mod/go.sum change touched.
 	ChangedModules []string
+	// ReflectiveSymbols are changed symbols that nothing appears to call,
+	// which means reflection rather than dead code.
+	ReflectiveSymbols []string
 }
 
 // modulePackages returns the packages that import something from one of the
@@ -251,6 +254,7 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	unresolved := make(map[string]bool)
 	ignored := make(map[string]bool)
 	resolved := make(map[string]bool)
+	orphans := make(map[string]bool)
 	dirs := dirIndex(g)
 
 	for _, h := range hunks {
@@ -340,6 +344,28 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	if g.Reaching != nil {
 		reaching = g.Reaching(changed)
 	}
+
+	// Distrust a total zero, and only a total zero. If the walk found nothing
+	// but ran into functions that nothing calls, reachability is unknown rather
+	// than empty -- something dispatches to them reflectively -- so fall back
+	// to those functions' packages.
+	//
+	// Gating on zero matters. Falling back whenever the walk meets any orphan
+	// selected 72.8% more tests across 25 cli/cli merges, taking one commit
+	// from 22 tests to 1185: orphans are common, and most walks pass one
+	// without the answer being wrong. A diff that reaches some tests statically
+	// and others only reflectively is still under-selected; that is the
+	// residual reflection gap, not something this closes.
+	if len(changed) > 0 && len(reaching) == 0 {
+		for _, key := range g.Boundaries(changed) {
+			if pkg := g.KeyPackage(key); pkg != "" {
+				dirtyPkgs[pkg] = true
+				orphans[key] = true
+			}
+		}
+	}
+	res.DirtyPackages = sortedKeys(dirtyPkgs)
+	res.ReflectiveSymbols = sortedKeys(orphans)
 	for _, t := range g.Tests {
 		if r, ok := match(t, reaching, dirtyPkgs, modAffected, g.PkgDeps[t.PkgPath]); ok {
 			res.Selected = append(res.Selected, Selected{PkgPath: t.PkgPath, Name: t.Name, Reason: r})

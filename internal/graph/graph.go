@@ -270,8 +270,8 @@ func Build(cfg Config) (*Graph, error) {
 		g.nodeKey[i] = k
 		g.byKey[k] = append(g.byKey[k], int32(i))
 		g.keys[k] = true
-		if _, ok := g.keyPkg[k]; !ok {
-			g.keyPkg[k] = pathOf(pkgOf(fn))
+		if g.keyPkg[k] == "" {
+			g.keyPkg[k] = packagePathOf(fn)
 		}
 		n := cg.Nodes[fn]
 		for _, e := range n.In {
@@ -376,6 +376,74 @@ func (g *Graph) reaching(changed map[string]bool) map[*Test]string {
 	return hits
 }
 
+// Boundaries reports the reflection boundaries a backward walk from the
+// changed symbols runs into.
+//
+// A node with no callers that is not an entry point is the signature of
+// reflection: RTA adds the methods of any type reaching the runtime-types set,
+// so a method dispatched through a reflect.Value gets a node but never an
+// incoming edge. The walk then stops there and reports nothing, which reads as
+// "no test is affected" when the truth is "we cannot see".
+//
+// Measured on cli/cli: mutating (DiscussionActor).Export selected zero tests
+// and discussion/view.TestViewRun failed anyway, because cmdutil's JSON
+// exporter reaches Discussion.ExportData through reflect.ValueOf. Export has
+// callers; ExportData, one level up, does not.
+//
+// Callers should treat a boundary's package as dirty rather than believing the
+// zero.
+func (g *Graph) Boundaries(changed map[string]bool) []string {
+	if len(g.nodeKey) == 0 {
+		return nil
+	}
+	var seeds []int32
+	for key := range changed {
+		seeds = append(seeds, g.byKey[key]...)
+	}
+	if len(seeds) == 0 {
+		return nil
+	}
+	found := make(map[string]bool)
+	visited := make(map[int32]bool)
+	queue := append([]int32(nil), seeds...)
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		if visited[n] {
+			continue
+		}
+		visited[n] = true
+		key := g.nodeKey[n]
+		if g.testByKey[key] != nil {
+			continue
+		}
+		if len(g.rev[n]) == 0 {
+			if !g.isEntry(key) {
+				found[key] = true
+			}
+			continue
+		}
+		queue = append(queue, g.rev[n]...)
+	}
+	out := make([]string, 0, len(found))
+	for k := range found {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isEntry reports whether a symbol is expected to have no callers.
+func (g *Graph) isEntry(key string) bool {
+	if g.testByKey[key] != nil {
+		return true
+	}
+	return strings.HasSuffix(key, ".init") || strings.HasSuffix(key, ".main")
+}
+
+// KeyPackage returns the package path declaring a symbol.
+func (g *Graph) KeyPackage(key string) string { return g.keyPkg[key] }
+
 // InCallGraph reports whether a symbol appears anywhere in the call graph, and
 // so could be reached by some test. A symbol absent from it is dead code as far
 // as the suite is concerned.
@@ -384,6 +452,31 @@ func (g *Graph) InCallGraph(key string) bool { return g.keys[key] }
 // visible reports whether a test binary could reach into the given package.
 func (g *Graph) visible(t *Test, pkgPath string) bool {
 	return pkgPath == t.PkgPath || g.PkgDeps[t.PkgPath][pkgPath]
+}
+
+// packagePathOf resolves the package a function belongs to.
+//
+// fn.Pkg is nil for synthesised wrappers -- the pointer-receiver shim ssa
+// generates for a value-receiver method, for instance -- and those are exactly
+// the functions reflection dispatches to. Leaving them unattributed made the
+// reflection fallback silently do nothing, because there was no package to
+// mark dirty.
+func packagePathOf(fn *ssa.Function) string {
+	for fn.Parent() != nil {
+		fn = fn.Parent()
+	}
+	if fn.Pkg != nil && fn.Pkg.Pkg != nil {
+		return runPath(fn.Pkg.Pkg.Path())
+	}
+	if obj := fn.Object(); obj != nil && obj.Pkg() != nil {
+		return runPath(obj.Pkg().Path())
+	}
+	if sig := fn.Signature; sig != nil && sig.Recv() != nil {
+		if named := namedOf(sig.Recv().Type()); named != nil && named.Obj().Pkg() != nil {
+			return runPath(named.Obj().Pkg().Path())
+		}
+	}
+	return ""
 }
 
 func pathOf(p *ssa.Package) string {
