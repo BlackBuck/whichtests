@@ -165,24 +165,36 @@ matters, so the fallbacks are deliberately blunt:
 
 ## Known gaps
 
-These are real and currently unhandled. Each is a reason the tool can under-select.
+These are real. Each is a reason the tool can under-select, which is the only
+failure mode that matters.
 
-- **Reflection and `go:linkname`** are invisible to RTA. A test that reaches a
-  function only through `reflect.Call` will not be selected.
+- **Reflection**, partially. A function nothing appears to call is treated as
+  reflectively reached and its package is marked dirty, but only when the walk
+  finds *no* tests at all — gating it more widely cost 72.8% precision for no
+  measured recall. A diff that reaches some tests statically and others only
+  reflectively is still under-selected.
+- **`go:linkname`** is invisible to the call graph and has no fallback.
 - **Deleted functions.** A hunk that removes a whole function has no new-side
-  span to resolve against, so it falls through to the package-level path. Sound,
-  but coarse.
-- **`testdata` and golden files** are outside the package graph, so any change to
-  them triggers the conservative path under `-safe`.
-- **Build tags.** Only the default build configuration is loaded; code behind
-  other tags is neither analysed nor selected.
-- **Subtests.** Selection is per top-level `Test` function; `-run` cannot narrow
-  to a `t.Run` case.
+  span to resolve against, so it falls through to the package-level path.
+  Sound, but coarse.
+- **Build tags.** Only the default build configuration is loaded. Code behind
+  another tag is neither analysed nor selectable, so a change to it selects
+  nothing: cli/cli commit `9b6585be` rewrites 845 lines of a build-tagged
+  `acceptance_test.go` and whichtests reports 4 tests. Correct for the suite
+  being selected from, useless if you expected those tests covered. Analyze
+  with the tag if you need them.
+- **Subtests.** Selection is per top-level `Test` function; `-run` cannot
+  narrow to a `t.Run` case. Table-driven cases share a reach set, so static
+  analysis cannot separate them at all.
 - **Cross-module changes.** Only the module under analysis is diffed.
 - **Residual over-selection.** VTA and the import-closure filter remove the
-  worst of it, but shared dynamic dispatch *within* a single import closure can
+  worst of it, but shared dynamic dispatch *within* one import closure can
   still link unrelated code. This errs toward running too much, never too
   little.
+
+Two entries that used to be here are gone because they were fixed: `testdata`
+and golden files now resolve to the package that owns them rather than
+escalating, and `go.mod` churn narrows to the modules' importers.
 
 ## Usage
 
@@ -266,6 +278,39 @@ acceptance suite is behind a build tag and is not in the analyzed set at all.
 That is correct for the suite being selected from, and useless if you expected
 the acceptance tests to be covered. Analyze with the build tag if you need
 them.
+
+### Declaration changes resolve to functions
+
+A hunk landing outside any function body -- a type, const, var, or interface --
+used to mark the whole package dirty, which is precisely the `go test`
+algorithm. Whenever that fired, the tool was by construction no better than
+doing nothing. cli/cli commit `75fc31e5` adds one line to an interface:
+
+```go
+ type errWithExitCode interface {
++	error
+ 	ExitCode() int
+ }
+```
+
+`go test` re-runs 205 packages = 1232 tests. whichtests used to select exactly
+1232. It now resolves the declaration to the five functions that reference it:
+
+| | Tests |
+|---|---:|
+| `go test ./...` | 1232 |
+| whichtests, package-dirty fallback | 1232 |
+| whichtests, declaration resolution | **872** |
+
+References are collected two ways, and missing either causes under-selection:
+naming the identifier, and *selecting* on it (`v.Bar` reads a struct field
+without ever writing the type's name). A declaration with no recorded
+references still falls back to package-level dirt, because "genuinely unused"
+and "our index missed the uses" are indistinguishable from here.
+
+Honest caveat on the aggregate: this moved the mean over 25 merges from 80.0%
+to 75.7% and fired on only 4 commits. The package-dirty fallback turned out
+*not* to be the dominant one; the conservative rate did not move at all.
 
 ### Dependency bumps narrow to their importers
 
