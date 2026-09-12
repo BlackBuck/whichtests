@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/BlackBuck/whichtests/internal/graph"
 )
@@ -22,6 +23,7 @@ func doctor(args []string) error {
 	cache := fs.Bool("cache", true, "reuse an on-disk graph when the module's sources are unchanged")
 	fat := fs.Int("fat", 20, "tests per package above which a package has real headroom")
 	tags := fs.String("tags", "", "comma-separated build tags")
+	sample := fs.Int("sample", 200, "functions to sample when estimating the typical selection")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -74,9 +76,9 @@ func doctor(args []string) error {
 		return fattest[i].path < fattest[j].path
 	})
 
-	fmt.Printf("fattest packages (where selecting within a package pays):\n")
+	fmt.Printf("fattest packages:\n")
 	for i, p := range fattest {
-		if i >= 5 || p.n < *fat {
+		if i >= 3 || p.n < *fat {
 			break
 		}
 		fmt.Printf("  %5d  %s\n", p.n, p.path)
@@ -84,24 +86,45 @@ func doctor(args []string) error {
 	if fattest[0].n < *fat {
 		fmt.Printf("  none with %d or more tests\n", *fat)
 	}
-
-	share := 100 * float64(inFat) / float64(total)
-	fmt.Printf("\n%.0f%% of tests live in packages of %d or more.\n", share, *fat)
 	fmt.Println()
 
-	switch {
-	case share >= 50:
-		fmt.Println("Verdict: worth trying on a warm cache. Most of your suite sits in")
-		fmt.Println("packages big enough that skipping within one is a real saving.")
-	case share >= 20:
-		fmt.Println("Verdict: marginal on a warm cache. A minority of your suite is in")
-		fmt.Println("packages big enough to benefit, so the gain depends on where your")
-		fmt.Println("changes land.")
-	default:
-		fmt.Println("Verdict: little to gain on a warm cache. `go test` already skips")
-		fmt.Println("packages a change cannot affect, and yours are too small for")
-		fmt.Println("selecting within one to matter.")
+	// Package size looked like the thing that mattered and is not. gin holds
+	// 96% of its tests in fat packages, and a change to almost any function
+	// there selects 454 of 456 tests, because every test builds an Engine and
+	// reaches nearly everything. cobra is the same story. What actually
+	// predicts the saving is how much the tests *differ* in what they reach,
+	// so measure that directly rather than guessing from a proxy.
+	keys := sampleSymbols(g, *sample)
+	if len(keys) == 0 {
+		fmt.Println("no analysable functions found")
+		return nil
 	}
+	ratios := make([]float64, 0, len(keys))
+	for _, k := range keys {
+		ratios = append(ratios, float64(len(g.Reaching(map[string]bool{k: true})))/float64(total))
+	}
+	sort.Float64s(ratios)
+	med := ratios[len(ratios)/2]
+	p10 := ratios[len(ratios)/10]
+	p90pick := ratios[min(int(float64(len(ratios))*0.9), len(ratios)-1)]
+
+	fmt.Printf("sampled %d functions; a change to one selects:\n", len(ratios))
+	fmt.Printf("  p10 %.1f%%   median %.1f%%   p90 %.1f%%   of the suite\n\n",
+		100*p10, 100*med, 100*p90pick)
+
+	switch {
+	case med <= 0.10:
+		fmt.Println("Verdict: worth trying. A typical change reaches a small slice of")
+		fmt.Println("the suite, which is exactly what this can skip.")
+	case med <= 0.40:
+		fmt.Println("Verdict: marginal. A typical change reaches a sizeable fraction of")
+		fmt.Println("the suite, so the saving depends on where your changes land.")
+	default:
+		fmt.Println("Verdict: little to gain. Your tests mostly reach the same code, so")
+		fmt.Println("there is little for reachability to tell apart. That is common in a")
+		fmt.Println("cohesive package where every test builds the same object.")
+	}
+	fmt.Println()
 
 	fmt.Println()
 	fmt.Println("Cold CI is a separate question. With nothing cached `go test` runs")
@@ -109,6 +132,52 @@ func doctor(args []string) error {
 	fmt.Println("against the whole suite rather than against the cache. Persisting")
 	fmt.Println("GOCACHE between runs is the cheaper thing to try first.")
 	return nil
+}
+
+// sampleSymbols picks real source functions, spread across packages so one
+// enormous package cannot dominate the estimate.
+func sampleSymbols(g *graph.Graph, n int) []string {
+	byPkg := map[string][]string{}
+	seen := map[string]bool{}
+	for file, spans := range g.Spans {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		for _, sp := range spans {
+			if seen[sp.Key] || sp.BodyOffset == 0 || !g.InCallGraph(sp.Key) {
+				continue
+			}
+			if strings.Contains(sp.Key, "#") || strings.HasSuffix(sp.Key, ".init") {
+				continue
+			}
+			seen[sp.Key] = true
+			byPkg[sp.PkgPath] = append(byPkg[sp.PkgPath], sp.Key)
+		}
+	}
+	pkgs := make([]string, 0, len(byPkg))
+	for p := range byPkg {
+		sort.Strings(byPkg[p])
+		pkgs = append(pkgs, p)
+	}
+	sort.Strings(pkgs)
+
+	var out []string
+	for round := 0; len(out) < n; round++ {
+		progressed := false
+		for _, p := range pkgs {
+			if round < len(byPkg[p]) {
+				out = append(out, byPkg[p][round])
+				progressed = true
+				if len(out) >= n {
+					return out
+				}
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	return out
 }
 
 func min(a, b int) int {

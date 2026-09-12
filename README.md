@@ -51,38 +51,54 @@ nothing. Against that baseline, warm:
 | core package declaration change | 1232 | 872 |
 | 11 function-body faults | 6680 | 4548 |
 
-**0–32% better, never dramatically better.** The only headroom left is
-selecting *within* a changed package, and one number caps it:
+**0–32% better, never dramatically better.** The headroom left is selecting
+*within* a changed package — and what governs that is not what I first assumed.
+
+### Package size does not predict the saving
+
+Measured across four repositories of different shape:
+
+| repo | packages | tests | median tests/pkg | saving vs `go test` |
+|---|---:|---:|---:|---:|
+| cli/cli | 250 | 1714 | 4 | **32%** |
+| cobra | 2 | 285 | 260 | 2% |
+| gin | 6 | 653 | 46 | 0% |
+
+The repo with the *smallest* packages saves the most, and the two with fat
+packages save nothing. `gin.Context.GetInt64` is reached by 454 of 456 tests:
+every test builds an Engine, so reachability has nothing to tell apart. A fat
+package only helps if its tests actually exercise different code.
+
+What predicts the saving is how much the tests differ in what they reach, so
+`doctor` measures that directly:
 
 ```console
 $ whichtests doctor
 250 packages with tests, 1714 tests total
 tests per package: median 4, mean 6.9, p90 15, max 82
 
-fattest packages (where selecting within a package pays):
-     82  github.com/cli/cli/v2/api
-     78  github.com/cli/cli/v2/internal/config
-     60  github.com/cli/cli/v2/pkg/cmd/extension
+sampled 200 functions; a change to one selects:
+  p10 0.2%   median 1.3%   p90 7.5%   of the suite
 
-32% of tests live in packages of 20 or more.
-
-Verdict: marginal on a warm cache. A minority of your suite is in
-packages big enough to benefit, so the gain depends on where your
-changes land.
+Verdict: worth trying. A typical change reaches a small slice of
+the suite, which is exactly what this can skip.
 ```
 
-**Median 4 tests per package.** Nothing to skip, which is exactly what
-21-vs-22 shows. Go's conventions push toward many small packages, so most
-repositories look like this — run `whichtests doctor` on yours before wiring
-anything in.
+Median selection tracks the measured saving where package size inverts it:
 
-**Use it when** your CI has no warm cache (persisting `GOCACHE` is the cheaper
-first move — try that first), your suite is slow enough that a 30% cut is worth
-seconds of analysis, or your packages are fat: cli/cli's `./api` has 82 tests,
-`internal/config` 78.
+| repo | median selection | verdict | measured saving |
+|---|---:|---|---:|
+| cli/cli | 1.3% | worth trying | 32% |
+| prometheus | 1.5% | worth trying | — |
+| gin | 69.5% | little to gain | 0% |
+| cobra | 75.1% | little to gain | 2% |
 
-**Don't** when your repo looks like cli/cli warm: many small packages, a fast
-suite, and a cache you could just persist.
+**Use it when** `doctor` puts your median selection in single digits, your CI
+has no warm cache (persisting `GOCACHE` is the cheaper first move), or your
+suite is slow enough that a 30% cut is worth seconds of analysis.
+
+**Don't** when your tests mostly reach the same code, which is the usual shape
+of a cohesive library with one big package.
 
 ## How it works
 
@@ -231,6 +247,12 @@ there are no failures to miss. `whichtests-mutate` manufactures them: panic one
 function, run the suite, check every test that failed was one whichtests would
 have run.
 
+| repo | mutants | killed | caught in selection |
+|---|---:|---:|---:|
+| cli/cli | 80 | 61 | **61** |
+| gin | 25 | 24 | **24** |
+| cobra | 25 | 22 | **22** |
+
 ```
 injected 80 fault(s), skipped 0
 killed by the suite: 61
@@ -242,7 +264,15 @@ Getting there took a real violation that 12 mutants had missed. Mutating
 anyway: `cmdutil`'s JSON exporter reaches `ExportData` through
 `reflect.ValueOf`, so RTA gives it a node but never an incoming edge. A node
 with no callers that is not an entry point is the signature of reflection, and
-the selector now falls back to its package.
+the selector falls back to its package when that boundary sits in a package the
+diff touched.
+
+gin produced a second one: mutating `(gin.H).MarshalXML` selected a single test
+— a direct unit test of it — while `TestContextRenderXML` failed, because
+`encoding/xml` reaches the method through its pointer-receiver wrapper. One
+static caller was enough to defeat an earlier "only when nothing is reachable"
+gate. Scoping to the changed symbol's package costs 12.9% precision on cli/cli
+against 72.8% for applying every boundary a walk passes.
 
 ### Recall, against a real breakage
 
