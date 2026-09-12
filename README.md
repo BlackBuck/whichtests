@@ -56,46 +56,46 @@ nothing. Against that baseline, warm:
 
 ### Package size does not predict the saving
 
-Measured across four repositories of different shape:
+Measured across four repositories of different shape. "Saving" is against
+`go test` with a warm cache, over a sample of functions:
 
-| repo | packages | tests | median tests/pkg | saving vs `go test` |
-|---|---:|---:|---:|---:|
-| cli/cli | 250 | 1714 | 4 | **32%** |
-| cobra | 2 | 285 | 260 | 2% |
-| gin | 6 | 653 | 46 | 0% |
+| repo | packages | tests | median tests/pkg | median selection | saving |
+|---|---:|---:|---:|---:|---:|
+| cli/cli | 250 | 1714 | 4 | 2.7% | **21%** |
+| prometheus | 89 | 2202 | 6 | 37.8% | 12% |
+| cobra | 2 | 285 | 260 | 100% | 3% |
+| gin | 6 | 653 | 46 | 69.5% | 2% |
 
-The repo with the *smallest* packages saves the most, and the two with fat
-packages save nothing. `gin.Context.GetInt64` is reached by 454 of 456 tests:
-every test builds an Engine, so reachability has nothing to tell apart. A fat
-package only helps if its tests actually exercise different code.
+The repos with the *smallest* packages save the most, and the two with fat
+packages save almost nothing. `gin.Context.GetInt64` is reached by 454 of 456
+tests: every test builds an Engine, so reachability has nothing to tell apart.
+A fat package only helps if its tests exercise different code.
 
-What predicts the saving is how much the tests differ in what they reach, so
-`doctor` measures that directly:
+On three of these four, the **median** change saves nothing at all; the
+aggregate comes from a minority of changes that happen to be well isolated.
+That is the honest shape of the warm-cache case.
+
+`doctor` measures this on your repo rather than guessing from package size:
 
 ```console
 $ whichtests doctor
 250 packages with tests, 1714 tests total
 tests per package: median 4, mean 6.9, p90 15, max 82
 
-sampled 200 functions; a change to one selects:
-  p10 0.2%   median 1.3%   p90 7.5%   of the suite
+sampled 120 functions; a change to one selects:
+  p10 1.2%   median 2.7%   p90 60.0%   of the suite
+
+against `go test` with a warm cache, over 113 reachable functions:
+  it would run 35884 tests, whichtests 28418 — 21% fewer
+  median saving on a single change: 42%
 
 Verdict: worth trying. A typical change reaches a small slice of
 the suite, which is exactly what this can skip.
 ```
 
-Median selection tracks the measured saving where package size inverts it:
-
-| repo | median selection | verdict | measured saving |
-|---|---:|---|---:|
-| cli/cli | 1.3% | worth trying | 32% |
-| prometheus | 1.5% | worth trying | — |
-| gin | 69.5% | little to gain | 0% |
-| cobra | 75.1% | little to gain | 2% |
-
 **Use it when** `doctor` puts your median selection in single digits, your CI
 has no warm cache (persisting `GOCACHE` is the cheaper first move), or your
-suite is slow enough that a 30% cut is worth seconds of analysis.
+suite is slow enough that a fifth off is worth seconds of analysis.
 
 **Don't** when your tests mostly reach the same code, which is the usual shape
 of a cohesive library with one big package.
