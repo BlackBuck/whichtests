@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BlackBuck/whichtests/internal/gitdiff"
 	"github.com/BlackBuck/whichtests/internal/graph"
@@ -32,12 +33,14 @@ func doctor(args []string) error {
 		return err
 	}
 
+	started := time.Now()
 	g, err := graph.Build(graph.Config{
 		Dir: *dir, Patterns: fs.Args(), Cache: *cache, Tags: splitTags(*tags),
 	})
 	if err != nil {
 		return err
 	}
+	analysis := time.Since(started)
 
 	perPkg := make(map[string]int)
 	for _, t := range g.Tests {
@@ -158,14 +161,34 @@ func doctor(args []string) error {
 	fmt.Printf("  p10 %.1f%%   median %.1f%%   p90 %.1f%%   of the suite\n\n",
 		100*p10, 100*med, 100*p90pick)
 
+	var aggregate float64
 	if len(savings) > 0 {
+		aggregate = float64(sumBase-sumSel) / float64(sumBase)
 		fmt.Printf("against `go test` with a warm cache, over %d reachable functions:\n", len(savings))
 		fmt.Printf("  it would run %d tests, whichtests %d — %.0f%% fewer\n",
-			sumBase, sumSel, 100*float64(sumBase-sumSel)/float64(sumBase))
+			sumBase, sumSel, 100*aggregate)
 		fmt.Printf("  median saving on a single change: %.0f%%\n\n", 100*savings[len(savings)/2])
 	}
 
+	// The analysis is not free, and on a large module it is not cheap either.
+	// Kubernetes takes five minutes and 7.5GB to conclude it would skip 1% of
+	// the suite, which is a straight loss. Say so rather than leaving the
+	// arithmetic to the reader.
+	if g.CacheHit {
+		fmt.Printf("analysis: restored from cache, so its real cost is not measured here.\n")
+		fmt.Printf("re-run with -cache=false to see what a cold run costs.\n")
+	} else {
+		fmt.Printf("analysis cost: %s\n", analysis.Round(time.Millisecond))
+	}
+	if aggregate > 0 {
+		fmt.Printf("to break even, the tests it skips must take longer than that to run.\n")
+	}
+	fmt.Println()
+
 	switch {
+	case !g.CacheHit && aggregate > 0 && aggregate < 0.05 && analysis > 30*time.Second:
+		fmt.Println("Verdict: not worth it. The analysis costs more than the")
+		fmt.Println("handful of tests it would skip, so this would slow you down.")
 	case med <= 0.10:
 		fmt.Println("Verdict: worth trying. A typical change reaches a small slice of")
 		fmt.Println("the suite, which is exactly what this can skip.")

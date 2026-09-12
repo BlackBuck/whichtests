@@ -56,24 +56,33 @@ nothing. Against that baseline, warm:
 
 ### Package size does not predict the saving
 
-Measured across four repositories of different shape. "Saving" is against
+Measured across five repositories of different shape. "Saving" is against
 `go test` with a warm cache, over a sample of functions:
 
-| repo | packages | tests | median tests/pkg | median selection | saving |
+| repo | packages | tests | median selection | saving | analysis |
 |---|---:|---:|---:|---:|---:|
-| cli/cli | 250 | 1714 | 4 | 2.7% | **21%** |
-| prometheus | 89 | 2202 | 6 | 37.8% | 12% |
-| cobra | 2 | 285 | 260 | 100% | 3% |
-| gin | 6 | 653 | 46 | 69.5% | 2% |
+| cli/cli | 250 | 1714 | 2.7% | **23%** | 4.8s |
+| prometheus | 89 | 2202 | 37.8% | 8% | 23.8s |
+| cobra | 2 | 285 | 100% | 3% | 0.6s |
+| gin | 6 | 653 | 69.5% | 0% | 2.2s |
+| kubernetes | 877 | 7461 | 14.0% | 1% | **2m51s** |
 
-The repos with the *smallest* packages save the most, and the two with fat
-packages save almost nothing. `gin.Context.GetInt64` is reached by 454 of 456
-tests: every test builds an Engine, so reachability has nothing to tell apart.
-A fat package only helps if its tests exercise different code.
+Two things this kills.
 
-On three of these four, the **median** change saves nothing at all; the
-aggregate comes from a minority of changes that happen to be well isolated.
-That is the honest shape of the warm-cache case.
+**Package size does not predict the saving.** The repos with the *smallest*
+packages save the most, and the two with fat packages save almost nothing.
+`gin.Context.GetInt64` is reached by 454 of 456 tests: every test builds an
+Engine, so reachability has nothing to tell apart. A fat package only helps if
+its tests exercise different code.
+
+**Bigger is not better either.** Kubernetes spends 2m51s and 7.5GB of RAM to
+conclude it would skip 1% of the suite — a straight loss. Analysis scales with
+the module while the saving does not: 3.5x the packages of cli/cli for 35x the
+analysis time and a twentieth of the benefit.
+
+On four of these five the **median** change saves nothing at all; the aggregate
+comes from a minority of changes that happen to be well isolated. That is the
+honest shape of the warm-cache case.
 
 `doctor` measures this on your repo rather than guessing from package size:
 
@@ -85,20 +94,27 @@ tests per package: median 4, mean 6.9, p90 15, max 82
 sampled 120 functions; a change to one selects:
   p10 1.2%   median 2.7%   p90 60.0%   of the suite
 
-against `go test` with a warm cache, over 113 reachable functions:
-  it would run 35884 tests, whichtests 28418 — 21% fewer
+against `go test` with a warm cache, over 60 reachable functions:
+  it would run 19632 tests, whichtests 15075 — 23% fewer
   median saving on a single change: 42%
+
+analysis cost: 4.838s
+to break even, the tests it skips must take longer than that to run.
 
 Verdict: worth trying. A typical change reaches a small slice of
 the suite, which is exactly what this can skip.
 ```
 
+On kubernetes the same command says **"not worth it. The analysis costs more
+than the handful of tests it would skip, so this would slow you down."**
+
 **Use it when** `doctor` puts your median selection in single digits, your CI
 has no warm cache (persisting `GOCACHE` is the cheaper first move), or your
 suite is slow enough that a fifth off is worth seconds of analysis.
 
-**Don't** when your tests mostly reach the same code, which is the usual shape
-of a cohesive library with one big package.
+**Don't** when your tests mostly reach the same code — the usual shape of a
+cohesive library with one big package — or when the module is large enough that
+analysing it costs more than the tests it saves.
 
 ## How it works
 
