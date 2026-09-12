@@ -12,11 +12,18 @@ import (
 // fixture: package "a" holds Foo (reached by TestFoo) and Bar (reached by
 // TestBar); package "b" imports "a" and has TestB.
 func fixture() *graph.Graph {
-	return &graph.Graph{
+	// Reachability the loader would have derived: TestFoo and TestB reach
+	// a.Foo; TestBar reaches a.Bar.
+	reach := map[string]map[string]bool{
+		"TestFoo": {"a.TestFoo": true, "a.Foo": true},
+		"TestBar": {"a.TestBar": true, "a.Bar": true},
+		"TestB":   {"b.TestB": true, "a.Foo": true},
+	}
+	g := &graph.Graph{
 		Tests: []*graph.Test{
-			{Name: "TestFoo", PkgPath: "a", Reach: map[string]bool{"a.TestFoo": true, "a.Foo": true}},
-			{Name: "TestBar", PkgPath: "a", Reach: map[string]bool{"a.TestBar": true, "a.Bar": true}},
-			{Name: "TestB", PkgPath: "b", Reach: map[string]bool{"b.TestB": true, "a.Foo": true}},
+			{Name: "TestFoo", PkgPath: "a"},
+			{Name: "TestBar", PkgPath: "a"},
+			{Name: "TestB", PkgPath: "b"},
 		},
 		Spans: map[string][]graph.FuncSpan{
 			"/r/a/a.go": {
@@ -30,6 +37,19 @@ func fixture() *graph.Graph {
 			"b": {"a": true},
 		},
 	}
+	g.Reaching = func(changed map[string]bool) map[*graph.Test]string {
+		hits := map[*graph.Test]string{}
+		for _, t := range g.Tests {
+			for key := range changed {
+				if reach[t.Name][key] {
+					hits[t] = key
+					break
+				}
+			}
+		}
+		return hits
+	}
+	return g
 }
 
 func names(r *Result) []string {
@@ -247,9 +267,9 @@ func TestModuleNarrowing(t *testing.T) {
 		"b": {"a": true, "example.com/dep/sub": true},
 		"c": {"example.com/other": true},
 	}
-	g.Tests = append(g.Tests, &graph.Test{
-		Name: "TestC", PkgPath: "c", Reach: map[string]bool{"c.TestC": true},
-	})
+	// TestC reaches nothing the fixture's Reaching knows about; it exists to
+	// prove an unaffected package stays unselected.
+	g.Tests = append(g.Tests, &graph.Test{Name: "TestC", PkgPath: "c"})
 
 	opts := Options{Modules: gitdiff.ModuleChange{
 		Touched: true,

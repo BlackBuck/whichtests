@@ -108,6 +108,9 @@ func Run(opts Options) (*Summary, error) {
 
 	sum := &Summary{}
 	for i, c := range cands {
+		// Counting reachers is a backward walk, so it is only worth doing for
+		// the handful of candidates actually sampled.
+		c.Reaching = len(g.Reaching(map[string]bool{c.Key: true}))
 		if opts.Progress != nil {
 			opts.Progress(fmt.Sprintf("[%d/%d] %s (%d tests reach it)", i+1, len(cands), c.Key, c.Reaching))
 		}
@@ -134,12 +137,6 @@ func Run(opts Options) (*Summary, error) {
 // Candidates returns every function a fault can be injected into: it has a
 // body, it is not itself a test, and at least one test reaches it.
 func Candidates(g *graph.Graph) []Candidate {
-	reaching := make(map[string]int)
-	for _, t := range g.Tests {
-		for key := range t.Reach {
-			reaching[key]++
-		}
-	}
 	testKeys := make(map[string]bool, len(g.Tests))
 	for _, t := range g.Tests {
 		testKeys[t.PkgPath+"."+t.Name] = true
@@ -151,7 +148,16 @@ func Candidates(g *graph.Graph) []Candidate {
 			continue
 		}
 		for _, s := range spans {
-			if s.BodyOffset == 0 || reaching[s.Key] == 0 || testKeys[s.Key] {
+			// A symbol absent from the call graph is dead code as far as the
+			// suite is concerned: the mutant could not fail anything, so it
+			// could not expose a missed test either.
+			if s.BodyOffset == 0 || testKeys[s.Key] || !g.InCallGraph(s.Key) {
+				continue
+			}
+			// Skip the generated test main package and synthesised inits.
+			// Editing _testmain.go mutates a file the toolchain regenerates,
+			// so the fault never reaches a build.
+			if synthetic(s.PkgPath, s.Key) {
 				continue
 			}
 			out = append(out, Candidate{
@@ -160,12 +166,19 @@ func Candidates(g *graph.Graph) []Candidate {
 				File:       file,
 				Line:       s.StartLine,
 				BodyOffset: s.BodyOffset,
-				Reaching:   reaching[s.Key],
 			})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
+}
+
+// synthetic reports whether a symbol belongs to generated scaffolding rather
+// than to source a person wrote.
+func synthetic(pkgPath, key string) bool {
+	return strings.HasSuffix(pkgPath, ".test") ||
+		strings.Contains(key, "#") ||
+		strings.HasSuffix(key, ".init")
 }
 
 const marker = `panic("whichtests injected fault")` + "\n"
@@ -204,10 +217,8 @@ func inject(g *graph.Graph, c Candidate, opts Options) Result {
 	// function, taken straight from the reachability map rather than round
 	// tripping through a diff.
 	selected := make(map[string]bool)
-	for _, t := range g.Tests {
-		if t.Reach[c.Key] {
-			selected[t.PkgPath+"."+t.Name] = true
-		}
+	for t := range g.Reaching(map[string]bool{c.Key: true}) {
+		selected[t.PkgPath+"."+t.Name] = true
 	}
 	r.Selected = len(selected)
 

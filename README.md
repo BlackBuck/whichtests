@@ -426,18 +426,44 @@ whichtests-replay [flags]
 
 ## Performance
 
-Analysis is a full SSA build plus an RTA and a VTA pass, so it scales with the
-module, not with the diff. On [cli/cli](https://github.com/cli/cli) (310
-packages, 1713 tests) a run takes about 20 seconds on an M-series laptop.
+Loading, SSA, RTA and VTA scale with the module; the reachability query scales
+with the diff. On [cli/cli](https://github.com/cli/cli) (310 packages, 1713
+tests) analysis takes about 4 seconds.
 
-Most of the speedup came from recording less. Traversal still walks through the
-standard library — dropping those edges would be unsound — but recording them
-stored roughly 3k keys per test for symbols no diff of the module could ever
-name. Restricting recording to in-scope packages took a run from 3m47s to
-1m10s; VTA's tighter graph took it to 20s.
+```
+PHASE ssa     0.40s
+PHASE index   0.08s
+PHASE rta     0.75s
+PHASE vta     1.74s
+PHASE query   ~0.2s
+```
 
-Caching the reach map keyed by build ID is the next big win: CI currently pays
-for RTA on every commit, and the map only changes when the call graph does.
+The query used to be 16.5s of a 20.8s run. It walked *forwards* from all 1714
+tests, building a reach set each, to answer a question about two changed
+symbols — and retained 945,338 keys to do it. Walking backwards from the
+changed symbols instead took the mean analysis over 25 replayed merges from
+21.4s to 4.3s, with selections identical on every commit.
+
+Seeds are grouped by declaring package so the import-closure filter stays
+exact, and the walk stops at test entry points, since nothing meaningfully
+calls a test. A symbol reachable from a package `init` still selects every test
+in that package, because package-level state is built before any of them run.
+
+### Cold CI
+
+The comparison that matters for CI, where no cache carries over between runs.
+Commit `8fcd6a64`, two Go files changed, 67 of 1714 tests selected:
+
+| cold cache | wall clock |
+|---|---:|
+| `go test ./...` | **153.7s** |
+| whichtests: 5s analysis + 18s selected tests | **23s** |
+
+**6.7x.** This is the strongest case for the tool and the one where the
+warm-cache comparison in [When this is worth using](#when-this-is-worth-using)
+does not apply — with nothing cached, `go test` has no way to skip anything.
+Persisting `GOCACHE` between CI runs is still the cheaper first move, and it
+changes this comparison back to the warm-cache one.
 
 ## Roadmap
 
@@ -451,17 +477,16 @@ for RTA on every commit, and the map only changes when the call graph does.
 - [x] Ignore documentation and assets instead of escalating on them
 - [x] Resolve type/const/var changes to their referencing functions
 - [ ] Load build-tag-gated packages (`acceptance/` caused 3 of 25 escalations)
-- [ ] Map `acceptance/*.txtar` fixtures and `script/*.sh` to the packages that
-      read them (`.txtar` and `.sh` now cause 9 of the 11 remaining escalations)
+- [x] Map fixtures and testdata to the packages that own them
 - [x] Narrow `go.mod`/`go.sum` escalation using the changed modules' reverse deps
-- [ ] Reverse the traversal: walk `callgraph.Node.In` from the changed symbols
-      instead of building a reach set per test. The forward BFS is 16.5s of a
-      20.8s cli/cli run, and it builds 1714 sets to answer a 2-symbol query.
+- [x] Reverse the traversal: walk `callgraph.Node.In` from the changed symbols
+      instead of building a reach set per test (21.4s -> 4.3s mean)
 - [ ] `whichtests doctor`: report the tests-per-package distribution so someone
       can tell in 30 seconds whether this repository has any headroom
 - [x] Fault injection (`whichtests-mutate`) to measure recall without waiting
       for history to break
-- [ ] Cache the reachability map keyed by build ID, so CI pays for RTA once
+- [ ] Cache the SSA/RTA/VTA graph keyed by build ID, so CI pays for it once
+      (the per-test reach map this originally referred to no longer exists)
 - [ ] Handle deleted functions by parsing the base revision's AST
 - [ ] Subtest granularity
 - [ ] GitHub Action wrapper

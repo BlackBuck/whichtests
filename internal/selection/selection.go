@@ -334,8 +334,14 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 		return res
 	}
 
+	// One backward walk from the changed symbols, rather than a forward reach
+	// set per test.
+	var reaching map[*graph.Test]string
+	if g.Reaching != nil {
+		reaching = g.Reaching(changed)
+	}
 	for _, t := range g.Tests {
-		if r, ok := match(t, changed, dirtyPkgs, modAffected, g.PkgDeps[t.PkgPath]); ok {
+		if r, ok := match(t, reaching, dirtyPkgs, modAffected, g.PkgDeps[t.PkgPath]); ok {
 			res.Selected = append(res.Selected, Selected{PkgPath: t.PkgPath, Name: t.Name, Reason: r})
 		}
 	}
@@ -343,11 +349,9 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	return res
 }
 
-func match(t *graph.Test, changed, dirty, modAffected map[string]bool, deps map[string]bool) (Reason, bool) {
-	for key := range t.Reach {
-		if changed[key] {
-			return Reason{Kind: "symbol", Detail: key}, true
-		}
+func match(t *graph.Test, reaching map[*graph.Test]string, dirty, modAffected map[string]bool, deps map[string]bool) (Reason, bool) {
+	if key, ok := reaching[t]; ok {
+		return Reason{Kind: "symbol", Detail: key}, true
 	}
 	if dirty[t.PkgPath] {
 		return Reason{Kind: "package", Detail: t.PkgPath}, true

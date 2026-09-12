@@ -31,7 +31,6 @@ type Test struct {
 	Name    string // "TestServe"
 	PkgPath string // import path to hand to `go test`, with any _test suffix trimmed
 	Fn      *ssa.Function
-	Reach   map[string]bool
 }
 
 // FuncSpan is the line range a top-level function declaration occupies in a
@@ -80,6 +79,21 @@ type Graph struct {
 
 	// LoadErrors counts packages that failed to type-check.
 	LoadErrors int
+
+	// cg is retained so reachability can be queried backwards, per diff.
+	cg *callgraph.Graph
+	// byKey finds every ssa function carrying a symbol key. A key collapses
+	// closures into their enclosing function, so one key can name several.
+	byKey map[string][]*ssa.Function
+	// testOf maps a test entry point to its Test.
+	testOf map[*ssa.Function]*Test
+	// initOf maps a package to its synthesised init.
+	initOf map[*ssa.Package]*ssa.Function
+
+	// Reaching answers "which tests can reach these symbols", mapping each to
+	// the symbol that reached it. Build installs the call-graph walk; tests
+	// that construct a Graph by hand substitute a fixture.
+	Reaching func(changed map[string]bool) map[*Test]string
 
 	// indexed guards against double-indexing a file. With Tests:true a package
 	// is loaded several times over (itself, the internal test variant, the
@@ -180,135 +194,136 @@ func Build(cfg Config) (*Graph, error) {
 
 	// One RTA pass covers every test, which is the only affordable option: a
 	// pass per test would be O(tests) full analyses. The price is that RTA's
-	// address-taken set is global, so `testing.tRunner`'s indirect `t.F()` call
-	// gets an edge to every func(*testing.T) in the program. Any test that
-	// calls t.Run then "reaches" every other test, and through them the whole
-	// module. Left alone, that makes every diff select 100% of the suite.
-	//
-	// Cutting edges into a *different* test's subgraph removes exactly that
-	// contamination while keeping a test's own subtest closures, which is where
-	// the work being measured actually happens.
-	// RTA first to bound the program to what the tests can reach, then VTA to
-	// refine it. RTA resolves an indirect call to every address-taken function
-	// with a matching signature, which makes ubiquitous `func()` call sites
-	// (sync.Once.Do, defer wrappers) global hubs: on cli/cli a two-symbol diff
-	// selected all 1704 tests because one closure inside the changed function
-	// was linked from every init in the standard library. VTA tracks which
-	// function values actually flow to a call site, which collapses those hubs.
+	// address-taken set is global, so ubiquitous indirect calls become hubs --
+	// `testing.tRunner`'s t.F() gets an edge to every func(*testing.T) in the
+	// program. VTA refines that by tracking which function values actually
+	// flow to a call site.
 	rtaRes := rta.Analyze(roots, true)
 	reachable := make(map[*ssa.Function]bool, len(rtaRes.Reachable))
 	for fn := range rtaRes.Reachable {
 		reachable[fn] = true
 	}
-	r := &reacher{
-		cg:      vta.CallGraph(reachable, rtaRes.CallGraph),
-		tests:   make(map[*ssa.Function]bool, len(g.Tests)),
-		inScope: inScope,
-		path:    make(map[*ssa.Package]string),
-	}
+	g.cg = vta.CallGraph(reachable, rtaRes.CallGraph)
+	g.initOf = initOf
+	g.testOf = make(map[*ssa.Function]*Test, len(g.Tests))
 	for _, t := range g.Tests {
-		r.tests[t.Fn] = true
+		g.testOf[t.Fn] = t
 	}
-	for _, t := range g.Tests {
-		// A test can only reach packages its own test binary imports. Any edge
-		// outside that closure is provably false, whatever the call graph says,
-		// so this filter is sound by construction and cheap.
-		allowed := g.PkgDeps[t.PkgPath]
-		t.Reach = r.reachable(t.Fn, allowed, t.PkgPath, initOf[t.Fn.Pkg])
+	g.byKey = make(map[string][]*ssa.Function, len(g.cg.Nodes))
+	for fn := range g.cg.Nodes {
+		k := Key(fn)
+		g.byKey[k] = append(g.byKey[k], fn)
 	}
+	g.Reaching = g.reaching
 	return g, nil
 }
 
-type reacher struct {
-	cg    *callgraph.Graph
-	tests map[*ssa.Function]bool
-	// inScope holds the packages a diff can actually touch. Traversal still
-	// walks through the standard library, but recording those keys would store
-	// ~3k entries per test for symbols no diff of this module can ever name.
-	inScope map[*ssa.Package]bool
-	// path caches import paths so the per-function closure check stays cheap.
-	path map[*ssa.Package]string
+// Reaching returns the tests that can reach any of the changed symbols, each
+// mapped to the symbol that reached it.
+//
+// The walk runs backwards from the changed symbols rather than forwards from
+// every test. Forward reachability is diff-independent and therefore cacheable,
+// but CI answers exactly one diff per run: building 1714 reach sets to answer a
+// two-symbol query was 16.5s of a 20.8s analysis, and 945k retained keys.
+//
+// Seeds are grouped by declaring package so the import-closure filter stays
+// exact. A test binary cannot call into a package it does not transitively
+// import, so an edge leaving that closure is false whatever the call graph
+// says -- and without the filter a two-symbol diff selects the whole suite.
+func (g *Graph) reaching(changed map[string]bool) map[*Test]string {
+	hits := make(map[*Test]string)
+	if len(changed) == 0 || g.cg == nil {
+		return hits
+	}
+
+	groups := make(map[string][]*ssa.Function)
+	seedKey := make(map[*ssa.Function]string)
+	for key := range changed {
+		for _, fn := range g.byKey[key] {
+			p := pathOf(pkgOf(fn))
+			groups[p] = append(groups[p], fn)
+			seedKey[fn] = key
+		}
+	}
+
+	for pkgPath, seeds := range groups {
+		visited := make(map[*ssa.Function]bool)
+		from := make(map[*ssa.Function]string, len(seeds))
+		queue := make([]*ssa.Function, 0, len(seeds))
+		for _, fn := range seeds {
+			queue = append(queue, fn)
+			from[fn] = seedKey[fn]
+		}
+
+		for len(queue) > 0 {
+			fn := queue[0]
+			queue = queue[1:]
+			if fn == nil || visited[fn] {
+				continue
+			}
+			visited[fn] = true
+
+			if t := g.testOf[outermost(fn)]; t != nil {
+				// Arriving at a test is the answer; nothing meaningful calls a
+				// test, and walking past one would leak into its callers.
+				if _, ok := hits[t]; !ok && g.visible(t, pkgPath) {
+					hits[t] = from[fn]
+				}
+				continue
+			}
+			n := g.cg.Nodes[fn]
+			if n == nil {
+				continue
+			}
+			for _, e := range n.In {
+				if e.Caller == nil || e.Caller.Func == nil {
+					continue
+				}
+				if _, seen := from[e.Caller.Func]; !seen {
+					from[e.Caller.Func] = from[fn]
+				}
+				queue = append(queue, e.Caller.Func)
+			}
+		}
+
+		// Package-level state is built before any test in the package runs, so
+		// a symbol reachable from a package init affects every test there.
+		for _, t := range g.Tests {
+			if _, ok := hits[t]; ok {
+				continue
+			}
+			if init := g.initOf[t.Fn.Pkg]; init != nil && visited[init] && g.visible(t, pkgPath) {
+				hits[t] = from[init]
+			}
+		}
+	}
+	return hits
 }
 
-func (r *reacher) pkgPath(p *ssa.Package) string {
-	if p == nil {
-		return ""
-	}
-	if v, ok := r.path[p]; ok {
-		return v
-	}
-	v := ""
-	if p.Pkg != nil {
-		v = runPath(p.Pkg.Path())
-	}
-	r.path[p] = v
-	return v
+// InCallGraph reports whether a symbol appears anywhere in the call graph, and
+// so could be reached by some test. A symbol absent from it is dead code as far
+// as the suite is concerned.
+func (g *Graph) InCallGraph(key string) bool { return len(g.byKey[key]) > 0 }
+
+// visible reports whether a test binary could reach into the given package.
+func (g *Graph) visible(t *Test, pkgPath string) bool {
+	return pkgPath == t.PkgPath || g.PkgDeps[t.PkgPath][pkgPath]
 }
 
-// owner returns the test entry point a function belongs to (itself, or the
-// test it is a closure inside), or nil if it belongs to no test.
-func (r *reacher) owner(fn *ssa.Function) *ssa.Function {
+func outermost(fn *ssa.Function) *ssa.Function {
 	for fn.Parent() != nil {
 		fn = fn.Parent()
 	}
-	if r.tests[fn] {
-		return fn
-	}
-	return nil
+	return fn
 }
 
-// reachable walks the call graph from a test entry point. The package init is
-// seeded alongside it because package-level state is built before the test
-// runs, so a change there does affect the test.
-func (r *reacher) reachable(self *ssa.Function, allowed map[string]bool, own string, also ...*ssa.Function) map[string]bool {
-	out := make(map[string]bool)
-	visited := make(map[*ssa.Function]bool)
-	queue := []*ssa.Function{self}
-	for _, s := range also {
-		if s != nil {
-			queue = append(queue, s)
-		}
+func pathOf(p *ssa.Package) string {
+	if p == nil || p.Pkg == nil {
+		return ""
 	}
-	for len(queue) > 0 {
-		fn := queue[0]
-		queue = queue[1:]
-		if fn == nil || visited[fn] {
-			continue
-		}
-		visited[fn] = true
-		if p := pkgOf(fn); r.inScope[p] {
-			if path := r.pkgPath(p); path == own || allowed[path] {
-				out[Key(fn)] = true
-			}
-		}
-		n := r.cg.Nodes[fn]
-		if n == nil {
-			continue
-		}
-		for _, e := range n.Out {
-			if e.Callee == nil || e.Callee.Func == nil {
-				continue
-			}
-			if o := r.owner(e.Callee.Func); o != nil && o != self {
-				continue
-			}
-			queue = append(queue, e.Callee.Func)
-		}
-	}
-	return out
+	return runPath(p.Pkg.Path())
 }
 
-// Key is the canonical identity of a symbol, shared by the call-graph side and
-// the diff side of the analysis.
-//
-// Two normalizations matter:
-//
-//   - Closures collapse into their enclosing top-level function. A diff hunk
-//     inside a closure resolves to the enclosing FuncDecl in the AST, so the
-//     graph side has to agree or the two never match.
-//   - Generic instantiations collapse into their origin, so editing the body
-//     of Map[T] matches a test that only ever reaches Map[int].
-//
 // pkgOf returns the package a function belongs to, following closures out to
 // their enclosing declaration.
 func pkgOf(fn *ssa.Function) *ssa.Package {

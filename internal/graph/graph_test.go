@@ -119,21 +119,17 @@ func TestBuildThroughSymlink(t *testing.T) {
 	// calls t.Run and so reaches testing.tRunner, whose indirect t.F() call RTA
 	// wires to every func(*testing.T) in the program. Without cutting those
 	// cross-test edges this assertion fails and every diff selects 100%.
+	reaching := map[string]bool{}
+	for tst := range g.Reaching(map[string]bool{"example.com/demo/store.Normalize": true}) {
+		reaching[tst.Name] = true
+	}
 	for _, tc := range []struct {
 		test string
 		want bool
 	}{{"TestNormalize", true}, {"TestPut", false}} {
-		var found *Test
-		for _, x := range g.Tests {
-			if x.Name == tc.test {
-				found = x
-			}
-		}
-		if found == nil {
-			t.Fatalf("%s not found", tc.test)
-		}
-		if got := found.Reach["example.com/demo/store.Normalize"]; got != tc.want {
-			t.Errorf("%s reaches Normalize = %v, want %v", tc.test, got, tc.want)
+		if got := reaching[tc.test]; got != tc.want {
+			t.Errorf("%s reaches Normalize = %v, want %v (reached: %v)",
+				tc.test, got, tc.want, reaching)
 		}
 	}
 }
