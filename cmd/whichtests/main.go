@@ -34,11 +34,12 @@ func run() error {
 		safe         = flag.Bool("safe", true, "fall back to every test when the diff touches files outside the package graph")
 		explain      = flag.Bool("explain", false, "show why each test was selected")
 		includeND    = flag.Bool("include-non-behavioral", false, "escalate on docs and assets too, instead of ignoring them")
+		cache        = flag.Bool("cache", true, "reuse an on-disk graph when the module's sources are unchanged")
 	)
 	flag.Parse()
 
 	started := time.Now()
-	g, err := graph.Build(graph.Config{Dir: *dir, Patterns: flag.Args()})
+	g, err := graph.Build(graph.Config{Dir: *dir, Patterns: flag.Args(), Cache: *cache})
 	if err != nil {
 		return err
 	}
@@ -61,6 +62,10 @@ func run() error {
 		IncludeNonBehavioral:     *includeND,
 		Modules:                  mods,
 	})
+
+	if g.CacheHit {
+		fmt.Fprintln(os.Stderr, "whichtests: reusing cached graph")
+	}
 
 	switch *format {
 	case "json":

@@ -449,6 +449,32 @@ exact, and the walk stops at test entry points, since nothing meaningfully
 calls a test. A symbol reachable from a package `init` still selects every test
 in that package, because package-level state is built before any of them run.
 
+### Caching the graph
+
+Loading, SSA, RTA and VTA depend only on the module's sources, so the result is
+cached to disk keyed by a hash of every Go file, `go.mod`, `go.sum`, the
+toolchain, and the build configuration.
+
+| cli/cli, same commit twice | |
+|---|---:|
+| first run (analyse and store) | **4.7s** |
+| second run (restore) | **0.13s** |
+
+**37x**, for an 18MB snapshot. `-cache=false` disables it; `WHICHTESTS_CACHE`
+moves it.
+
+The key deliberately over-approximates — it hashes `.go` files no package
+compiles, and the module's absolute path, because the snapshot stores absolute
+paths and a moved checkout must miss rather than resolve nothing. An
+unnecessary miss costs five seconds; a missed invalidation costs correctness.
+
+Making the graph cacheable required separating node identity from symbol key.
+Collapsing the graph to keys looks equivalent — `Key` already folds closures
+into their enclosing function — but it is not: "closure C inside F calls G"
+becomes "F calls G", so every caller of F suddenly reaches G. On one cli/cli
+commit that silently took the selection from 67 tests to 92. Nodes are indices
+now, and only what gets *recorded* is collapsed.
+
 ### Cold CI
 
 The comparison that matters for CI, where no cache carries over between runs.
@@ -485,8 +511,7 @@ changes this comparison back to the warm-cache one.
       can tell in 30 seconds whether this repository has any headroom
 - [x] Fault injection (`whichtests-mutate`) to measure recall without waiting
       for history to break
-- [ ] Cache the SSA/RTA/VTA graph keyed by build ID, so CI pays for it once
-      (the per-test reach map this originally referred to no longer exists)
+- [x] Cache the SSA/RTA/VTA graph keyed by the module's sources (4.7s -> 0.13s)
 - [ ] Handle deleted functions by parsing the base revision's AST
 - [ ] Subtest granularity
 - [ ] GitHub Action wrapper

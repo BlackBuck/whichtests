@@ -14,10 +14,10 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"sort"
 	"strings"
 
 	"github.com/BlackBuck/whichtests/internal/fsutil"
-	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/callgraph/rta"
 	"golang.org/x/tools/go/callgraph/vta"
 	"golang.org/x/tools/go/packages"
@@ -30,7 +30,11 @@ import (
 type Test struct {
 	Name    string // "TestServe"
 	PkgPath string // import path to hand to `go test`, with any _test suffix trimmed
-	Fn      *ssa.Function
+	Key     string // the test's own symbol key
+	// InitNode is the graph node of the test package's init. Package-level
+	// state is built before any test in the package runs, so a symbol
+	// reachable from here affects every test in it.
+	InitNode int32
 }
 
 // FuncSpan is the line range a top-level function declaration occupies in a
@@ -79,16 +83,30 @@ type Graph struct {
 
 	// LoadErrors counts packages that failed to type-check.
 	LoadErrors int
+	// CacheHit reports that this graph was restored from disk rather than
+	// analysed.
+	CacheHit bool
 
-	// cg is retained so reachability can be queried backwards, per diff.
-	cg *callgraph.Graph
-	// byKey finds every ssa function carrying a symbol key. A key collapses
-	// closures into their enclosing function, so one key can name several.
-	byKey map[string][]*ssa.Function
-	// testOf maps a test entry point to its Test.
-	testOf map[*ssa.Function]*Test
-	// initOf maps a package to its synthesised init.
-	initOf map[*ssa.Package]*ssa.Function
+	// rev is the reversed call graph: rev[i] holds the nodes calling node i.
+	// Nodes are indices rather than *ssa.Function so the graph can be cached,
+	// and each ssa function keeps its own node even when several share a
+	// symbol key.
+	//
+	// Keeping node identity separate from the key is not an optimisation, it
+	// is correctness. Key folds a closure into its enclosing function, so
+	// collapsing the graph itself would turn "closure C inside F calls G" into
+	// "F calls G", and every caller of F would suddenly reach G.
+	rev [][]int32
+	// nodeKey maps a node to the symbol key it is recorded under.
+	nodeKey []string
+	// byKey maps a symbol key to the nodes carrying it.
+	byKey map[string][]int32
+	// keys is every symbol the call graph knows.
+	keys map[string]bool
+	// keyPkg maps a symbol key to its declaring package path.
+	keyPkg map[string]string
+	// testByKey finds the test a symbol key belongs to, if any.
+	testByKey map[string]*Test
 
 	// Reaching answers "which tests can reach these symbols", mapping each to
 	// the symbol that reached it. Build installs the call-graph walk; tests
@@ -106,6 +124,10 @@ type Graph struct {
 type Config struct {
 	Dir      string   // module root
 	Patterns []string // package patterns, defaults to ./...
+	// Cache reads and writes an on-disk snapshot of the graph, keyed by the
+	// module's sources and build configuration. Leave it off when the caller
+	// rewrites source between builds, as the fault injector does.
+	Cache bool
 }
 
 // Build loads the module, constructs the call graph, and computes per-test
@@ -114,6 +136,19 @@ func Build(cfg Config) (*Graph, error) {
 	patterns := cfg.Patterns
 	if len(patterns) == 0 {
 		patterns = []string{"./..."}
+	}
+
+	var cacheKey string
+	if cfg.Cache {
+		// A cache failure must never be an analysis failure, so every error
+		// here falls through to a normal build.
+		if k, err := CacheKey(cfg.Dir, patterns); err == nil {
+			cacheKey = k
+			if g, ok := LoadCached(k); ok {
+				g.CacheHit = true
+				return g, nil
+			}
+		}
 	}
 
 	pcfg := &packages.Config{
@@ -150,6 +185,7 @@ func Build(cfg Config) (*Graph, error) {
 	g.Fset = prog.Fset
 
 	var roots []*ssa.Function
+	testFn := make(map[*Test]*ssa.Function)
 	initOf := make(map[*ssa.Package]*ssa.Function)
 	seen := make(map[*ssa.Function]bool)
 	inScope := make(map[*ssa.Package]bool)
@@ -179,11 +215,13 @@ func Build(cfg Config) (*Graph, error) {
 				continue
 			}
 			seen[fn] = true
-			g.Tests = append(g.Tests, &Test{
+			tst := &Test{
 				Name:    fn.Name(),
 				PkgPath: runPath(p.PkgPath),
-				Fn:      fn,
-			})
+				Key:     Key(fn),
+			}
+			testFn[tst] = fn
+			g.Tests = append(g.Tests, tst)
 			roots = append(roots, fn)
 		}
 	}
@@ -203,18 +241,66 @@ func Build(cfg Config) (*Graph, error) {
 	for fn := range rtaRes.Reachable {
 		reachable[fn] = true
 	}
-	g.cg = vta.CallGraph(reachable, rtaRes.CallGraph)
-	g.initOf = initOf
-	g.testOf = make(map[*ssa.Function]*Test, len(g.Tests))
-	for _, t := range g.Tests {
-		g.testOf[t.Fn] = t
+	cg := vta.CallGraph(reachable, rtaRes.CallGraph)
+
+	// Node order is made deterministic so a cached graph is reproducible.
+	fns := make([]*ssa.Function, 0, len(cg.Nodes))
+	for fn := range cg.Nodes {
+		fns = append(fns, fn)
 	}
-	g.byKey = make(map[string][]*ssa.Function, len(g.cg.Nodes))
-	for fn := range g.cg.Nodes {
+	sort.Slice(fns, func(i, j int) bool {
+		a, b := fns[i].String(), fns[j].String()
+		if a != b {
+			return a < b
+		}
+		return cg.Nodes[fns[i]].ID < cg.Nodes[fns[j]].ID
+	})
+	index := make(map[*ssa.Function]int32, len(fns))
+	for i, fn := range fns {
+		index[fn] = int32(i)
+	}
+
+	g.rev = make([][]int32, len(fns))
+	g.nodeKey = make([]string, len(fns))
+	g.byKey = make(map[string][]int32, len(fns))
+	g.keys = make(map[string]bool, len(fns))
+	g.keyPkg = make(map[string]string, len(fns))
+	for i, fn := range fns {
 		k := Key(fn)
-		g.byKey[k] = append(g.byKey[k], fn)
+		g.nodeKey[i] = k
+		g.byKey[k] = append(g.byKey[k], int32(i))
+		g.keys[k] = true
+		if _, ok := g.keyPkg[k]; !ok {
+			g.keyPkg[k] = pathOf(pkgOf(fn))
+		}
+		n := cg.Nodes[fn]
+		for _, e := range n.In {
+			if e.Caller == nil || e.Caller.Func == nil {
+				continue
+			}
+			if j, ok := index[e.Caller.Func]; ok {
+				g.rev[i] = append(g.rev[i], j)
+			}
+		}
 	}
+
+	g.testByKey = make(map[string]*Test, len(g.Tests))
+	for _, t := range g.Tests {
+		g.testByKey[t.Key] = t
+		t.InitNode = -1
+		if fn := testFn[t]; fn != nil {
+			if init := initOf[fn.Pkg]; init != nil {
+				if i, ok := index[init]; ok {
+					t.InitNode = i
+				}
+			}
+		}
+	}
+
 	g.Reaching = g.reaching
+	if cacheKey != "" {
+		_ = g.Save(cacheKey)
+	}
 	return g, nil
 }
 
@@ -232,68 +318,58 @@ func Build(cfg Config) (*Graph, error) {
 // says -- and without the filter a two-symbol diff selects the whole suite.
 func (g *Graph) reaching(changed map[string]bool) map[*Test]string {
 	hits := make(map[*Test]string)
-	if len(changed) == 0 || g.cg == nil {
+	if len(changed) == 0 {
 		return hits
 	}
 
-	groups := make(map[string][]*ssa.Function)
-	seedKey := make(map[*ssa.Function]string)
+	groups := make(map[string][]int32)
 	for key := range changed {
-		for _, fn := range g.byKey[key] {
-			p := pathOf(pkgOf(fn))
-			groups[p] = append(groups[p], fn)
-			seedKey[fn] = key
+		if !g.keys[key] {
+			continue // dead code: no test can reach it
 		}
+		pkg := g.keyPkg[key]
+		groups[pkg] = append(groups[pkg], g.byKey[key]...)
 	}
 
 	for pkgPath, seeds := range groups {
-		visited := make(map[*ssa.Function]bool)
-		from := make(map[*ssa.Function]string, len(seeds))
-		queue := make([]*ssa.Function, 0, len(seeds))
-		for _, fn := range seeds {
-			queue = append(queue, fn)
-			from[fn] = seedKey[fn]
+		visited := make(map[int32]bool)
+		from := make(map[int32]string, len(seeds))
+		queue := make([]int32, 0, len(seeds))
+		for _, n := range seeds {
+			queue = append(queue, n)
+			from[n] = g.nodeKey[n]
 		}
 
 		for len(queue) > 0 {
-			fn := queue[0]
+			n := queue[0]
 			queue = queue[1:]
-			if fn == nil || visited[fn] {
+			if visited[n] {
 				continue
 			}
-			visited[fn] = true
+			visited[n] = true
 
-			if t := g.testOf[outermost(fn)]; t != nil {
-				// Arriving at a test is the answer; nothing meaningful calls a
-				// test, and walking past one would leak into its callers.
+			if t := g.testByKey[g.nodeKey[n]]; t != nil {
+				// Arriving at a test is the answer; nothing meaningfully calls
+				// a test, and walking past one would leak into its callers.
 				if _, ok := hits[t]; !ok && g.visible(t, pkgPath) {
-					hits[t] = from[fn]
+					hits[t] = from[n]
 				}
 				continue
 			}
-			n := g.cg.Nodes[fn]
-			if n == nil {
-				continue
-			}
-			for _, e := range n.In {
-				if e.Caller == nil || e.Caller.Func == nil {
-					continue
+			for _, caller := range g.rev[n] {
+				if _, seen := from[caller]; !seen {
+					from[caller] = from[n]
 				}
-				if _, seen := from[e.Caller.Func]; !seen {
-					from[e.Caller.Func] = from[fn]
-				}
-				queue = append(queue, e.Caller.Func)
+				queue = append(queue, caller)
 			}
 		}
 
-		// Package-level state is built before any test in the package runs, so
-		// a symbol reachable from a package init affects every test there.
 		for _, t := range g.Tests {
 			if _, ok := hits[t]; ok {
 				continue
 			}
-			if init := g.initOf[t.Fn.Pkg]; init != nil && visited[init] && g.visible(t, pkgPath) {
-				hits[t] = from[init]
+			if t.InitNode >= 0 && visited[t.InitNode] && g.visible(t, pkgPath) {
+				hits[t] = from[t.InitNode]
 			}
 		}
 	}
@@ -303,18 +379,11 @@ func (g *Graph) reaching(changed map[string]bool) map[*Test]string {
 // InCallGraph reports whether a symbol appears anywhere in the call graph, and
 // so could be reached by some test. A symbol absent from it is dead code as far
 // as the suite is concerned.
-func (g *Graph) InCallGraph(key string) bool { return len(g.byKey[key]) > 0 }
+func (g *Graph) InCallGraph(key string) bool { return g.keys[key] }
 
 // visible reports whether a test binary could reach into the given package.
 func (g *Graph) visible(t *Test, pkgPath string) bool {
 	return pkgPath == t.PkgPath || g.PkgDeps[t.PkgPath][pkgPath]
-}
-
-func outermost(fn *ssa.Function) *ssa.Function {
-	for fn.Parent() != nil {
-		fn = fn.Parent()
-	}
-	return fn
 }
 
 func pathOf(p *ssa.Package) string {
