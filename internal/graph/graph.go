@@ -46,6 +46,18 @@ type FuncSpan struct {
 	BodyOffset int
 }
 
+// DeclSpan is the line range of a top-level type, const, or var declaration.
+// A diff hunk landing here used to mark the whole package dirty, which is
+// exactly what `go test` already does -- so the tool was no better than doing
+// nothing. Resolving the declaration to the functions that reference it turns
+// the most common fallback into real selection.
+type DeclSpan struct {
+	Keys      []string // declaration keys, one per name in the spec
+	PkgPath   string
+	StartLine int
+	EndLine   int
+}
+
 // Graph is the result of a single analysis pass over the module.
 type Graph struct {
 	Prog  *ssa.Program
@@ -59,6 +71,12 @@ type Graph struct {
 	// PkgDeps maps an import path to its transitive import closure. Used for
 	// the package-level fallback when a hunk lands outside any function body.
 	PkgDeps map[string]map[string]bool
+
+	// Decls is keyed by absolute file path, like Spans.
+	Decls map[string][]DeclSpan
+	// DeclRefs maps a declaration key to the functions that reference it,
+	// whether by naming the identifier or by selecting a field or method on it.
+	DeclRefs map[string]map[string]bool
 
 	// LoadErrors counts packages that failed to type-check.
 	LoadErrors int
@@ -101,10 +119,12 @@ func Build(cfg Config) (*Graph, error) {
 	}
 
 	g := &Graph{
-		Spans:   make(map[string][]FuncSpan),
-		FilePkg: make(map[string]string),
-		PkgDeps: make(map[string]map[string]bool),
-		indexed: make(map[string]bool),
+		Spans:    make(map[string][]FuncSpan),
+		FilePkg:  make(map[string]string),
+		PkgDeps:  make(map[string]map[string]bool),
+		indexed:  make(map[string]bool),
+		Decls:    make(map[string][]DeclSpan),
+		DeclRefs: make(map[string]map[string]bool),
 	}
 	packages.Visit(pkgs, nil, func(p *packages.Package) {
 		g.LoadErrors += len(p.Errors)
@@ -314,10 +334,20 @@ func Key(fn *ssa.Function) string {
 	return fn.String()
 }
 
-// indexSpans records the line range of every top-level FuncDecl in the package,
-// keyed the same way the call graph keys it. Resolving the *types.Func through
-// prog.FuncValue avoids reconstructing ssa's naming scheme by hand.
+// indexSpans records, per file, the line range of every top-level function and
+// of every top-level type/const/var declaration, plus the reverse index from a
+// declaration to the functions that reference it.
+//
+// Resolving the *types.Func through prog.FuncValue avoids reconstructing ssa's
+// naming scheme by hand.
 func (g *Graph) indexSpans(p *packages.Package, prog *ssa.Program) {
+	initKey := ""
+	if sp := prog.Package(p.Types); sp != nil {
+		if init := sp.Func("init"); init != nil {
+			initKey = Key(init)
+		}
+	}
+
 	for _, f := range p.Syntax {
 		pos := prog.Fset.Position(f.Pos())
 		if pos.Filename == "" {
@@ -329,33 +359,144 @@ func (g *Graph) indexSpans(p *packages.Package, prog *ssa.Program) {
 			continue
 		}
 		g.indexed[canon] = true
+
 		for _, d := range f.Decls {
-			fd, ok := d.(*ast.FuncDecl)
-			if !ok {
-				continue
+			switch decl := d.(type) {
+			case *ast.FuncDecl:
+				obj, _ := p.TypesInfo.Defs[decl.Name].(*types.Func)
+				if obj == nil {
+					continue
+				}
+				fn := prog.FuncValue(obj)
+				if fn == nil {
+					continue
+				}
+				start := prog.Fset.Position(decl.Pos())
+				end := prog.Fset.Position(decl.End())
+				var bodyOffset int
+				if decl.Body != nil {
+					bodyOffset = prog.Fset.Position(decl.Body.Lbrace).Offset + 1
+				}
+				g.Spans[canon] = append(g.Spans[canon], FuncSpan{
+					Key:        Key(fn),
+					PkgPath:    runPath(p.PkgPath),
+					StartLine:  start.Line,
+					EndLine:    end.Line,
+					BodyOffset: bodyOffset,
+				})
+			case *ast.GenDecl:
+				g.indexGenDecl(p, prog, canon, decl)
 			}
-			obj, _ := p.TypesInfo.Defs[fd.Name].(*types.Func)
-			if obj == nil {
-				continue
+		}
+		g.indexRefs(p, prog, canon, f, initKey)
+	}
+}
+
+func (g *Graph) indexGenDecl(p *packages.Package, prog *ssa.Program, file string, decl *ast.GenDecl) {
+	for _, spec := range decl.Specs {
+		var names []*ast.Ident
+		switch sp := spec.(type) {
+		case *ast.TypeSpec:
+			names = []*ast.Ident{sp.Name}
+		case *ast.ValueSpec:
+			names = sp.Names
+		default:
+			continue // import specs carry no declaration of our own
+		}
+		var keys []string
+		for _, n := range names {
+			if k := declKey(p.TypesInfo.Defs[n]); k != "" {
+				keys = append(keys, k)
 			}
-			fn := prog.FuncValue(obj)
-			if fn == nil {
-				continue
+		}
+		if len(keys) == 0 {
+			continue
+		}
+		start := prog.Fset.Position(spec.Pos())
+		end := prog.Fset.Position(spec.End())
+		g.Decls[file] = append(g.Decls[file], DeclSpan{
+			Keys:      keys,
+			PkgPath:   runPath(p.PkgPath),
+			StartLine: start.Line,
+			EndLine:   end.Line,
+		})
+	}
+}
+
+// indexRefs records which function each reference to a declaration sits inside.
+//
+// Two kinds of reference matter, and missing either causes under-selection:
+//
+//   - Naming the identifier: a signature mentioning Foo, a composite literal,
+//     a conversion.
+//   - Selecting on it: `v.Bar` where v's type is Foo. A function can read a
+//     struct's field without ever writing the type's name, so ident uses alone
+//     would miss it.
+//
+// A reference outside any function is attributed to the package init, since
+// package-level initialisers run before every test in the package.
+func (g *Graph) indexRefs(p *packages.Package, prog *ssa.Program, file string, f *ast.File, initKey string) {
+	spans := g.Spans[file]
+	enclosing := func(n ast.Node) string {
+		line := prog.Fset.Position(n.Pos()).Line
+		for _, s := range spans {
+			if line >= s.StartLine && line <= s.EndLine {
+				return s.Key
 			}
-			start := prog.Fset.Position(fd.Pos())
-			end := prog.Fset.Position(fd.End())
-			file := fsutil.Canon(start.Filename)
-			var bodyOffset int
-			if fd.Body != nil {
-				bodyOffset = prog.Fset.Position(fd.Body.Lbrace).Offset + 1
+		}
+		return initKey
+	}
+	add := func(declK, fnK string) {
+		if declK == "" || fnK == "" {
+			return
+		}
+		if g.DeclRefs[declK] == nil {
+			g.DeclRefs[declK] = make(map[string]bool)
+		}
+		g.DeclRefs[declK][fnK] = true
+	}
+
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.SelectorExpr:
+			if sel, ok := p.TypesInfo.Selections[node]; ok {
+				if named := namedOf(sel.Recv()); named != nil {
+					add(declKey(named.Obj()), enclosing(node))
+				}
 			}
-			g.Spans[file] = append(g.Spans[file], FuncSpan{
-				Key:        Key(fn),
-				PkgPath:    runPath(p.PkgPath),
-				StartLine:  start.Line,
-				EndLine:    end.Line,
-				BodyOffset: bodyOffset,
-			})
+		case *ast.Ident:
+			if obj := p.TypesInfo.Uses[node]; obj != nil {
+				if _, isFunc := obj.(*types.Func); !isFunc {
+					add(declKey(obj), enclosing(node))
+				}
+			}
+		}
+		return true
+	})
+}
+
+// declKey identifies a package-level declaration. It is a string rather than a
+// types.Object pointer because loading with Tests:true type-checks a package
+// more than once, so the same declaration has several distinct objects.
+func declKey(obj types.Object) string {
+	if obj == nil || obj.Pkg() == nil {
+		return ""
+	}
+	if obj.Parent() != obj.Pkg().Scope() {
+		return "" // local variable, parameter, or field
+	}
+	return runPath(obj.Pkg().Path()) + "." + obj.Name()
+}
+
+func namedOf(t types.Type) *types.Named {
+	for {
+		switch x := t.(type) {
+		case *types.Pointer:
+			t = x.Elem()
+		case *types.Named:
+			return x
+		default:
+			return nil
 		}
 	}
 }

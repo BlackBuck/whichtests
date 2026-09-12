@@ -136,6 +136,7 @@ func report(s *replay.Summary, verify bool) {
 	fmt.Printf("selection ratio: mean %.1f%%, median %.1f%%\n", 100*s.MeanRatio, 100*s.MedianRatio)
 	fmt.Printf("conservative (ran everything): %d of %d commits (%.1f%%)\n",
 		s.Conservative, s.Replayed, 100*float64(s.Conservative)/float64(s.Replayed))
+	fmt.Printf("declaration changes resolved to functions: %d commit(s)\n", s.DeclResolved)
 
 	if s.Conservative > 0 {
 		fmt.Println()

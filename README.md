@@ -233,6 +233,41 @@ what pushed commits onto the conservative path:
   .go              3 commit(s)
 ```
 
+### Declaration changes resolve to functions
+
+A hunk landing outside any function body -- a type, const, var, or interface --
+used to mark the whole package dirty, which is precisely the `go test`
+algorithm. Whenever that fired, the tool was by construction no better than
+doing nothing. cli/cli commit `75fc31e5` adds one line to an interface:
+
+```go
+ type errWithExitCode interface {
++	error
+ 	ExitCode() int
+ }
+```
+
+`go test` re-runs 205 packages = 1232 tests. whichtests used to select exactly
+1232. It now resolves the declaration to the five functions that reference it:
+
+| | Tests |
+|---|---:|
+| `go test ./...` | 1232 |
+| whichtests, package-dirty fallback | 1232 |
+| whichtests, declaration resolution | **872** |
+
+References are collected two ways, and missing either causes under-selection:
+naming the identifier, and *selecting* on it (`v.Bar` reads a struct field
+without ever writing the type's name). A declaration with no recorded
+references still falls back to package-level dirt, because "genuinely unused"
+and "our index missed the uses" are indistinguishable from here.
+
+Honest caveat on the aggregate: over 25 merges this moved the mean from 80.0%
+to 75.7% and fired on only 4 commits. The package-dirty fallback turned out
+*not* to be the dominant one -- the conservative rate stayed at 17 of 25,
+because those escalate on files outside the package graph (`go.mod`, `.yml`,
+`.sh`, `.txtar`, build-tagged `.go`), which this change does nothing about.
+
 ### What 25 cli/cli merges actually look like
 
 The distribution is bimodal, and the mean hides it:

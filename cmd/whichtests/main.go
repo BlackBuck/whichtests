@@ -91,6 +91,10 @@ func emitText(r *selection.Result, explain bool, took time.Duration) error {
 	fmt.Printf("%d of %d tests selected (%.1f%%) in %s\n", len(r.Selected), r.Total, pct, took.Round(time.Millisecond))
 	fmt.Printf("%d symbol(s) changed, %d package(s) dirty at package level\n",
 		len(r.ChangedSymbols), len(r.DirtyPackages))
+	if len(r.ResolvedDecls) > 0 {
+		fmt.Printf("%d declaration(s) resolved to referencing functions instead of dirtying a package\n",
+			len(r.ResolvedDecls))
+	}
 	if r.Conservative {
 		fmt.Println("selection was conservative: every test was included")
 	}

@@ -168,3 +168,63 @@ func TestNonBehavioralFilesDoNotEscalate(t *testing.T) {
 		t.Error("IncludeNonBehavioral should escalate a doc-only change")
 	}
 }
+
+// declFixture adds a type declaration to the fixture: package "a" declares
+// Config at lines 50-55, referenced only by a.Foo.
+func declFixture() *graph.Graph {
+	g := fixture()
+	g.Decls = map[string][]graph.DeclSpan{
+		"/r/a/a.go": {
+			{Keys: []string{"a.Config"}, PkgPath: "a", StartLine: 50, EndLine: 55},
+			{Keys: []string{"a.Orphan"}, PkgPath: "a", StartLine: 60, EndLine: 62},
+		},
+	}
+	g.DeclRefs = map[string]map[string]bool{
+		"a.Config": {"a.Foo": true},
+		// a.Orphan deliberately has no recorded references.
+	}
+	return g
+}
+
+func TestSelectResolvesDeclarations(t *testing.T) {
+	// A change to Config resolves to a.Foo, so only the tests reaching Foo run
+	// -- not every test in the package, which is what `go test` already does.
+	res := Select(declFixture(), []gitdiff.Hunk{{File: "/r/a/a.go", StartLine: 52, EndLine: 52}}, Options{})
+	got := names(res)
+	want := []string{"a.TestFoo", "b.TestB"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+	if len(res.DirtyPackages) != 0 {
+		t.Errorf("package should not be dirty, got %v", res.DirtyPackages)
+	}
+	if len(res.ResolvedDecls) != 1 || res.ResolvedDecls[0] != "a.Config" {
+		t.Errorf("ResolvedDecls = %v", res.ResolvedDecls)
+	}
+}
+
+func TestSelectFallsBackWhenDeclarationHasNoRefs(t *testing.T) {
+	// "genuinely unused" and "our index missed the uses" are indistinguishable
+	// here, so a declaration with no recorded references must still dirty the
+	// package rather than selecting nothing.
+	res := Select(declFixture(), []gitdiff.Hunk{{File: "/r/a/a.go", StartLine: 61, EndLine: 61}}, Options{})
+	if len(res.DirtyPackages) != 1 || res.DirtyPackages[0] != "a" {
+		t.Fatalf("expected package a dirty, got %v", res.DirtyPackages)
+	}
+	if len(res.Selected) != 3 {
+		t.Errorf("expected all 3 tests, got %d", len(res.Selected))
+	}
+}
+
+func TestSelectFallsBackOutsideAnyDeclaration(t *testing.T) {
+	// An import block or a blank line between declarations resolves to nothing.
+	res := Select(declFixture(), []gitdiff.Hunk{{File: "/r/a/a.go", StartLine: 5, EndLine: 5}}, Options{})
+	if len(res.DirtyPackages) != 1 {
+		t.Fatalf("expected the package dirty, got %v", res.DirtyPackages)
+	}
+}

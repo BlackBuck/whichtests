@@ -15,6 +15,10 @@ func (s *Store) Get(k string) (string, bool) {
 	return v, ok
 }
 
+// Key is referenced only by Normalize, so a change to this declaration must
+// select only TestNormalize rather than marking the whole package dirty.
+type Key string
+
 // Normalize is deliberately unreachable from TestPut/TestGet so that editing it
 // should select only TestNormalize.
-func Normalize(k string) string { return strings.ToLower(strings.TrimSpace(k)) }
+func Normalize(k string) Key { return Key(strings.ToLower(strings.TrimSpace(k))) }

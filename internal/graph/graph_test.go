@@ -3,6 +3,7 @@ package graph
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -10,6 +11,64 @@ import (
 // symlink-resolved paths while go/packages does not, so if Spans is keyed by
 // the unresolved path no diff hunk ever matches and every change silently
 // degrades to a full test run.
+// TestDeclRefs guards the reverse index that lets a type/const/var change
+// resolve to referencing functions instead of dirtying the whole package.
+// Without it every such change degrades to exactly what `go test` already does.
+func TestDeclRefs(t *testing.T) {
+	dir, err := filepath.Abs("../../example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Skip("example module not present")
+	}
+	g, err := Build(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refs := g.DeclRefs["example.com/demo/store.Key"]
+	if len(refs) == 0 {
+		t.Fatal("no references recorded for type Key")
+	}
+	if !refs["example.com/demo/store.Normalize"] {
+		t.Errorf("Normalize should reference Key, got %v", keysOf(refs))
+	}
+	if refs["(*example.com/demo/store.Store).Put"] {
+		t.Errorf("Put does not mention Key, got %v", keysOf(refs))
+	}
+
+	// The Store type is only ever touched through field selection inside its
+	// own methods, which ident uses alone would miss.
+	store := g.DeclRefs["example.com/demo/store.Store"]
+	if !store["(*example.com/demo/store.Store).Get"] {
+		t.Errorf("Get selects on Store fields but was not recorded: %v", keysOf(store))
+	}
+
+	var found bool
+	for _, spans := range g.Decls {
+		for _, d := range spans {
+			for _, k := range d.Keys {
+				if k == "example.com/demo/store.Key" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Error("no DeclSpan recorded for type Key")
+	}
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func TestBuildThroughSymlink(t *testing.T) {
 	real, err := filepath.Abs("../../example")
 	if err != nil {

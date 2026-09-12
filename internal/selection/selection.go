@@ -44,6 +44,43 @@ type Result struct {
 	Conservative bool
 	// IgnoredFiles were changed but provably cannot affect any test.
 	IgnoredFiles []string
+	// ResolvedDecls are declaration changes that were resolved to their
+	// referencing functions instead of marking the whole package dirty.
+	ResolvedDecls []string
+}
+
+// resolveDecl maps a hunk that missed every function body to the functions that
+// reference the declaration it landed on.
+//
+// A declaration with no recorded references falls back to package-level dirt on
+// purpose: "genuinely unused" and "our index missed the uses" look identical
+// from here, and only one of them is safe to act on.
+func resolveDecl(g *graph.Graph, h gitdiff.Hunk) ([]string, bool) {
+	var out []string
+	for _, d := range g.Decls[h.File] {
+		if h.StartLine > d.EndLine || h.EndLine < d.StartLine {
+			continue
+		}
+		for _, k := range d.Keys {
+			refs := g.DeclRefs[k]
+			if len(refs) == 0 {
+				return nil, false
+			}
+			for fn := range refs {
+				out = append(out, fn)
+			}
+		}
+	}
+	return out, len(out) > 0
+}
+
+func declLabel(g *graph.Graph, h gitdiff.Hunk) string {
+	for _, d := range g.Decls[h.File] {
+		if h.StartLine <= d.EndLine && h.EndLine >= d.StartLine && len(d.Keys) > 0 {
+			return d.Keys[0]
+		}
+	}
+	return ""
 }
 
 // nonBehavioral reports whether a changed file outside the package graph can be
@@ -99,6 +136,7 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	dirtyPkgs := make(map[string]bool)
 	unresolved := make(map[string]bool)
 	ignored := make(map[string]bool)
+	resolved := make(map[string]bool)
 
 	for _, h := range hunks {
 		spans, known := g.Spans[h.File]
@@ -118,17 +156,29 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 				hit = true
 			}
 		}
-		if !hit {
-			// Landed between functions: a type, const, var, or import change.
-			// Nothing finer than the package is sound here.
-			dirtyPkgs[pkg] = true
+		if hit {
+			continue
 		}
+		// Landed between functions: a type, const, var, or import change.
+		// Resolve it to the functions that reference the declaration rather
+		// than surrendering the whole package -- package-level dirt is exactly
+		// what `go test` already does, so falling back here means the tool
+		// bought nothing.
+		if keys, ok := resolveDecl(g, h); ok {
+			for _, k := range keys {
+				changed[k] = true
+			}
+			resolved[declLabel(g, h)] = true
+			continue
+		}
+		dirtyPkgs[pkg] = true
 	}
 
 	res.ChangedSymbols = sortedKeys(changed)
 	res.DirtyPackages = sortedKeys(dirtyPkgs)
 	res.UnresolvedFiles = sortedKeys(unresolved)
 	res.IgnoredFiles = sortedKeys(ignored)
+	res.ResolvedDecls = sortedKeys(resolved)
 
 	if opts.Conservative || (opts.ConservativeOnUnresolved && len(unresolved) > 0) {
 		res.Conservative = true
