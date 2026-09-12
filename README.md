@@ -37,9 +37,10 @@ whichtests is built around the two places the build cache doesn't help:
 ## How it works
 
 1. **Load** the module with `go/packages` (`Tests: true`) and build SSA.
-2. **Root** an RTA call graph at every `Test*` / `Benchmark*` / `Fuzz*` /
-   `Example*` function, plus package `init`s.
-3. **Reach** — BFS the call graph from each test to get its reachable symbol set.
+2. **Root** an RTA pass at every `Test*` / `Benchmark*` / `Fuzz*` / `Example*`
+   function plus package `init`s, then refine it with VTA.
+3. **Reach** — BFS the call graph from each test, recording only symbols inside
+   that test binary's import closure.
 4. **Diff** — `git diff --unified=0` from the merge base, including uncommitted
    work, into new-side line ranges.
 5. **Resolve** each hunk to the enclosing top-level function, via the FuncDecl
@@ -52,6 +53,36 @@ The one design detail that makes steps 3 and 5 agree is the symbol key
 function, and generic instantiations collapse into their origin. Without that,
 a change inside a closure produces an AST key of `pkg.Outer` while the call
 graph only ever has `pkg.Outer$1`, and the two never match.
+
+The second is call graph precision, which is the difference between a useful
+tool and a useless one. RTA resolves an indirect call to *every* address-taken
+function with a matching signature, so ubiquitous `func()` call sites —
+`sync.Once.Do`, defer wrappers, anything reachable from an `init` — become
+global hubs. On cli/cli a two-symbol diff selected all 1704 tests because one
+closure inside the changed function was linked from every standard library
+init. Three fixes, applied in order:
+
+| Fix | That commit |
+|---|---|
+| RTA only | 1704 / 1704 (100%) |
+| + VTA refinement (tracks what actually flows to a call site) | 971 (57%) |
+| + import-closure filter | **22 (1.3%)** |
+
+The import-closure filter is the cheap one and the only sound-by-construction
+one: a test binary cannot call into a package it does not transitively import,
+so any edge leaving that closure is provably false no matter what the call
+graph claims. Cross-test contamination is a special case of the same disease —
+`testing.tRunner`'s indirect `t.F()` call gets an edge to every
+`func(*testing.T)` in the program, so any test calling `t.Run` reaches every
+other test. That one is fixed by cutting edges into a *different* test's
+subgraph while keeping a test's own subtest closures.
+
+The third is path canonicalization (`internal/fsutil`). `git rev-parse
+--show-toplevel` reports a symlink-resolved path and `go/packages` does not, so
+on macOS any repo under `/tmp` or `/var` — and any checkout behind a symlinked
+workspace directory — produces `/private/var/...` on one side and `/var/...` on
+the other. Nothing errors; every file just looks unknown and every diff silently
+degrades to a full test run.
 
 ## Soundness
 
@@ -81,6 +112,10 @@ These are real and currently unhandled. Each is a reason the tool can under-sele
 - **Subtests.** Selection is per top-level `Test` function; `-run` cannot narrow
   to a `t.Run` case.
 - **Cross-module changes.** Only the module under analysis is diffed.
+- **Residual over-selection.** VTA and the import-closure filter remove the
+  worst of it, but shared dynamic dispatch *within* a single import closure can
+  still link unrelated code. This errs toward running too much, never too
+  little.
 
 ## Usage
 
@@ -105,11 +140,142 @@ whichtests [flags] [packages]
 
 ## Validation
 
-The claim worth defending is **recall**: over a long run of real commits, does
-the selected subset still catch every failure the full suite catches? The plan
-is to replay recent merges of a large Go repo (Grafana, Loki, containerd) and
-report, per commit, tests selected as a percentage and whether any failing test
-was missed. A selection percentage without a recall number means nothing.
+`whichtests-replay` replays a repository's first-parent history and measures the
+tool against what actually happened.
+
+```console
+# cheap: selection ratio over the last 100 merges, no test execution
+$ whichtests-replay -repo ../grafana -n 100
+
+# expensive: run the suite at each commit and check that every failing
+# test was selected
+$ whichtests-replay -repo ../grafana -n 20 -verify -baseline -json out.json
+```
+
+```
+replayed 25 commit(s), skipped 0
+selection ratio: mean 80.0%, median 100.0%
+conservative (ran everything): 17 of 25 commits (68.0%)
+
+what pushed commits onto the conservative path:
+  .mod             6 commit(s)
+  .sum             6 commit(s)
+  .yml             5 commit(s)
+  .sh              4 commit(s)
+  .txtar           4 commit(s)
+  .go              3 commit(s)
+```
+
+### What 25 cli/cli merges actually look like
+
+The distribution is bimodal, and the mean hides it:
+
+| Commit | Selected |
+|---|---|
+| docs-only PR | 0 / 1702 |
+| docs-only PR | 0 / 1702 |
+| validate repo names on create | 22 / 1704 (1.3%) |
+| delete the `repo garden` command | 42 / 1713 (2.5%) |
+| ssh certificate authority | 885 / 1702 (52%) |
+| fix agentic workflow | 1232 / 1702 (72%) |
+| invocation telemetry | 1440 / 1715 (84%) |
+| issue-13153 plan | 1508 / 1700 (89%) |
+| *the other 17* | everything (conservative) |
+
+Half the focused PRs land under 3%. The rest either touch a widely imported
+package or trip a fallback. `go.mod`/`go.sum` churn — dependabot merges, mostly
+— accounts for 6 of the 17 conservative commits and is genuinely unskippable: a
+dependency bump can change anything.
+
+The three `.go` escalations are all `acceptance/*_test.go`, which sits behind a
+build tag and so never enters the default package graph. That is the build-tag
+gap in [Known gaps](#known-gaps), measured rather than assumed.
+
+Two numbers, deliberately reported together:
+
+- **Selection ratio** is cheap — static analysis only, hundreds of commits in
+  minutes. On its own it proves nothing.
+- **Recall** is the number that decides whether the tool is safe to adopt: did
+  the selected subset still contain every test that failed? It costs one full
+  suite run per commit, two with `-baseline`. Budget hours, not minutes.
+
+`-baseline` also runs the suite at the parent commit so that only *newly*
+failing tests count. Without it, a test that was already broken before the diff
+is scored as a recall violation it had nothing to do with.
+
+A recall violation exits non-zero. It means the tool would have let a real
+failure ship, which is a bug, not a statistic.
+
+### Replaying history cannot measure recall
+
+Every commit on a protected trunk passed CI by construction, so `-verify` over
+green history finds no failing tests and reports recall as unmeasured. It burns
+hours to prove nothing. Use it to validate the pipeline, not to produce the
+number.
+
+`whichtests-mutate` produces the number, by manufacturing the failures:
+
+```console
+$ whichtests-mutate -C ../cli -n 12
+```
+
+For each sampled function it splices `panic(...)` into the top of the body, asks
+whichtests which tests it would select had that function changed, runs the whole
+suite, and checks that every test which actually failed was inside the
+selection. A failing test outside the selection is a recall violation — a real
+bug the tool would have let ship. Source is restored after each mutant, and a
+mutant nothing catches is reported separately, since it measures the suite's
+coverage rather than the tool's selection.
+
+```
+injected 4 fault(s), skipped 0
+killed by the suite: 4
+recall: 4 of 4 killed mutants were caught inside the selection
+no recall violations: every failing test was one whichtests would have run
+```
+
+```
+whichtests-mutate [flags]
+
+  -C string              module directory to analyze (default ".")
+  -n int                 number of faults to inject (default 10)
+  -seed int              sampling seed, for reproducible runs (default 1)
+  -test-timeout duration timeout for one `go test ./...` (default 25m)
+  -json string           write the full per-mutant result to this file
+  -quiet                 suppress per-mutant progress
+```
+
+Replaying uses a detached `git worktree` in a scratch directory, so the
+repository under test is never checked out from under you.
+
+```
+whichtests-replay [flags]
+
+  -repo string           git repository to replay (default ".")
+  -module string         module directory relative to -repo (default ".")
+  -rev string            revision to walk back from (default "HEAD")
+  -n int                 number of commits to replay (default 50)
+  -verify                run the suite at each commit to measure recall (slow)
+  -baseline              also run the suite at the parent so only newly failing tests count
+  -test-timeout duration timeout for one `go test ./...` (default 20m)
+  -json string           write the full per-commit result to this file
+  -quiet                 suppress per-commit progress
+```
+
+## Performance
+
+Analysis is a full SSA build plus an RTA and a VTA pass, so it scales with the
+module, not with the diff. On [cli/cli](https://github.com/cli/cli) (310
+packages, 1713 tests) a run takes about 20 seconds on an M-series laptop.
+
+Most of the speedup came from recording less. Traversal still walks through the
+standard library — dropping those edges would be unsound — but recording them
+stored roughly 3k keys per test for symbols no diff of the module could ever
+name. Restricting recording to in-scope packages took a run from 3m47s to
+1m10s; VTA's tighter graph took it to 20s.
+
+Caching the reach map keyed by build ID is the next big win: CI currently pays
+for RTA on every commit, and the map only changes when the call graph does.
 
 ## Roadmap
 
@@ -118,7 +284,13 @@ was missed. A selection percentage without a recall number means nothing.
 - [x] Diff hunk → enclosing symbol resolution
 - [x] Package-level and conservative fallbacks
 - [x] `text` / `json` / `go-test` output
-- [ ] Replay harness for the recall measurement above
+- [x] Replay harness (`whichtests-replay`) for selection ratio and recall
+- [x] VTA refinement and import-closure filtering
+- [x] Ignore documentation and assets instead of escalating on them
+- [ ] Load build-tag-gated packages (`acceptance/` caused 3 of 25 escalations)
+- [ ] Narrow `go.mod`/`go.sum` escalation using the changed modules' reverse deps
+- [x] Fault injection (`whichtests-mutate`) to measure recall without waiting
+      for history to break
 - [ ] Cache the reachability map keyed by build ID, so CI pays for RTA once
 - [ ] Handle deleted functions by parsing the base revision's AST
 - [ ] Subtest granularity
@@ -127,9 +299,11 @@ was missed. A selection percentage without a recall number means nothing.
 ## Development
 
 ```sh
-make build   # ./whichtests
+make build   # ./whichtests and ./whichtests-replay
 make test
 make demo    # run against the bundled example module
+make replay  # replay this repo's own history
+make mutate  # inject faults into the example module and check recall
 ```
 
 `example/` is a separate toy module used as a smoke test: three independent

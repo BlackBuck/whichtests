@@ -1,4 +1,6 @@
 /whichtests
+/whichtests-replay
+/whichtests-mutate
 /dist/
 *.out
 selection.json
