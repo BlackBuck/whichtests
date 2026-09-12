@@ -31,10 +31,12 @@ inputs:
     default: "true"
   version:
     description: >-
-      Version of whichtests to install. Use "local" to build from the checked
-      out source instead, which is how this repository tests its own action.
+      Version of whichtests to install. Defaults to the ref this action was
+      used at, so `uses: BlackBuck/whichtests@v1` installs the v1 binary rather
+      than floating against the default branch. Use "local" to build from the
+      checked out source, which is how this repository tests its own action.
     required: false
-    default: latest
+    default: ""
 
 outputs:
   selected:
@@ -75,13 +77,21 @@ runs:
           echo "::error::Go is not on PATH. Run actions/setup-go before this action."
           exit 1
         fi
-        if [ "${{ inputs.version }}" = "local" ]; then
+        version="${{ inputs.version }}"
+        if [ "$version" = "local" ]; then
           go build -o "$RUNNER_TEMP/whichtests" ./cmd/whichtests
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-        else
-          go install "github.com/BlackBuck/whichtests/cmd/whichtests@${{ inputs.version }}"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          exit 0
         fi
+        if [ -z "$version" ]; then
+          # Match the ref the action itself was used at, so a pinned action
+          # gets a pinned binary. Empty when the action is used by path.
+          version="${{ github.action_ref }}"
+        fi
+        : "${version:=latest}"
+        echo "installing whichtests@$version"
+        go install "github.com/BlackBuck/whichtests/cmd/whichtests@$version"
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
     - name: Select tests
       id: select

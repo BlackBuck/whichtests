@@ -188,6 +188,9 @@ It fetches the base branch, selects, and runs only what it selected, writing
 the count to the job summary. Inputs: `base`, `working-directory`, `tags`,
 `run`, `safe`, `version`. Outputs: `selected`, `total`, `plan`, `json`.
 
+`version` defaults to the ref the action was used at, so `@v1` installs the v1
+binary rather than floating against the default branch.
+
 `fetch-depth: 0` is not optional. `actions/checkout` defaults to a shallow
 clone, which leaves no merge base, which makes the diff come back empty — a
 selective run would then test nothing and report success. The action checks for
