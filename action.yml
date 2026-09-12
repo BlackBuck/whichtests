@@ -90,7 +90,14 @@ runs:
         fi
         : "${version:=latest}"
         echo "installing whichtests@$version"
-        go install "github.com/BlackBuck/whichtests/cmd/whichtests@$version"
+        # A ref is not necessarily a Go module version. `go install @v1` only
+        # works because a canonical vMAJOR.MINOR.PATCH tag exists for the query
+        # to resolve to; a branch name, or a repo tagged only "v1", resolves to
+        # nothing. Fall back rather than failing the job on it.
+        if ! go install "github.com/BlackBuck/whichtests/cmd/whichtests@$version"; then
+          echo "::warning::could not install whichtests@$version; falling back to latest"
+          go install "github.com/BlackBuck/whichtests/cmd/whichtests@latest"
+        fi
         echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
     - name: Select tests

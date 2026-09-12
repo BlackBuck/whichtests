@@ -205,7 +205,10 @@ the count to the job summary. Inputs: `base`, `working-directory`, `tags`,
 `run`, `safe`, `version`. Outputs: `selected`, `total`, `plan`, `json`.
 
 `version` defaults to the ref the action was used at, so `@v1` installs the v1
-binary rather than floating against the default branch.
+binary rather than floating against the default branch. That only works because
+the repo carries a canonical `vMAJOR.MINOR.PATCH` tag for the query to resolve
+to — `go install ...@v1` against a repo tagged only `v1` fails outright. The
+action warns and falls back to `latest` rather than failing the job.
 
 `fetch-depth: 0` is not optional. `actions/checkout` defaults to a shallow
 clone, which leaves no merge base, which makes the diff come back empty — a
