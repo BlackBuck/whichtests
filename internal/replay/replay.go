@@ -278,7 +278,11 @@ func missed(failing []string, res *selection.Result) []string {
 // "importpath.TestName". Subtests collapse into their parent, since -run
 // selection is per top-level test anyway.
 func runSuite(dir string, timeout time.Duration) (map[string]bool, error) {
-	cmd := exec.Command("go", "test", "-json", "-count=1",
+	// No -count=1. Go keys the test cache on the compiled test binary, so a
+	// package this commit does not affect has identical inputs and its cached
+	// pass is correct, while failures are never cached. That turns each
+	// verified commit from a full suite run into the affected packages.
+	cmd := exec.Command("go", "test", "-json",
 		"-timeout", timeout.String(), "./...")
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer

@@ -331,6 +331,33 @@ is scored as a recall violation it had nothing to do with.
 A recall violation exits non-zero. It means the tool would have let a real
 failure ship, which is a bug, not a statistic.
 
+### One real breakage from history
+
+Green trunk history yields no recall data, but trunk is not green everywhere.
+Commits titled "fix failing tests" mean their parents were broken, and walking
+back from `6c497e74` finds `f8651f5e` breaking `gist/edit.Test_editRun` with
+its parent `cf718037` still passing.
+
+```console
+$ whichtests-replay -repo ../cli -rev 6c497e74 -n 5 -verify -baseline
+```
+
+| commit | selected | newly failing | missed |
+|---|---:|---:|---:|
+| `6c497e74` (the fix) | 1 / 1277 | 0 | 0 |
+| `42238dc3` | 9 / 1277 | 0 | 0 |
+| `c98c4358` | 9 / 1277 | 0 | 0 |
+| **`f8651f5e`** | **9 / 1277** | **1** | **0** |
+| `cf718037` (trunk merge) | 1270 / 1277 | 0 | 0 |
+
+A genuine trunk breakage, caught inside 9 of 1277 tests. This is also what
+`-baseline` is for: the test is still failing at `c98c4358` and `42238dc3`, but
+it is not *newly* failing there, so neither commit is scored for a bug it did
+not introduce.
+
+Finding this range took manual archaeology, which is the honest reason to reach
+for fault injection instead:
+
 ### Replaying history cannot measure recall
 
 Every commit on a protected trunk passed CI by construction, so `-verify` over
