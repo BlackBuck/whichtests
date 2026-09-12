@@ -234,6 +234,43 @@ recall: 4 of 4 killed mutants were caught inside the selection
 no recall violations: every failing test was one whichtests would have run
 ```
 
+### Measured recall on cli/cli
+
+12 faults injected across [cli/cli](https://github.com/cli/cli), one function
+at a time, each followed by a full suite run:
+
+```
+injected 12 fault(s), skipped 0
+killed by the suite: 11
+recall: 11 of 11 killed mutants were caught inside the selection
+no recall violations: every failing test was one whichtests would have run
+```
+
+| Mutated function | Selected | Tests that failed |
+|---|---|---|
+| `(*extension.Manager).list` | 20 / 1714 | 1 |
+| `extension.normalizeExtension` | 28 / 1714 | 1 |
+| `pr/view.prLabelList` | 51 / 1714 | 1 |
+| `(*queries.ProjectItem).Number` | 62 / 1714 | 2 |
+| `attachments.newAttachableMarkdown` | 291 / 1714 | 6 |
+| `search.formatAdvancedIssueSearch` | 352 / 1714 | 4 |
+| `ghinstance.isGarage` | 949 / 1714 | 7 |
+| `(*safeurl.MutableSafeURL).String` | 1426 / 1714 | 86 |
+
+Selection is consistently much larger than the set that actually fails, which
+is the correct direction: reaching a function is not the same as asserting on
+its behaviour, and the tool only has to avoid *missing* tests.
+
+The twelfth mutant survived — `preview/prompter.runPassword`, which 18 tests
+reach statically but none execute. A survived mutant measures the suite's
+coverage, not the tool's selection, which is why the two are counted
+separately.
+
+Caveats worth stating: 12 mutants is a small sample, and a panic at the top of
+a body only exercises selection for changes *inside a function*. It says
+nothing about the package-level fallback (a changed type, const, or var) or the
+conservative paths, which are validated by unit tests rather than measurement.
+
 ```
 whichtests-mutate [flags]
 
