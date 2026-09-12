@@ -4,6 +4,7 @@ package selection
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -41,6 +42,40 @@ type Result struct {
 	UnresolvedFiles []string
 	// Conservative reports that the analysis gave up and selected everything.
 	Conservative bool
+	// IgnoredFiles were changed but provably cannot affect any test.
+	IgnoredFiles []string
+}
+
+// nonBehavioral reports whether a changed file outside the package graph can be
+// ignored rather than escalating to a full run.
+//
+// This matters more than any call graph refinement: replaying 25 cli/cli
+// commits, documentation churn alone forced a full suite run on 9 of them. The
+// rule is a narrow allowlist, and it deliberately does not trust an extension
+// alone:
+//
+//   - Anything under testdata/ or fixtures/ is off limits, since a .md or .png
+//     there is a golden file a test compares against.
+//   - //go:embed targets never reach this check; graph.indexEmbeds already
+//     attributes them to the package that embeds them, so changing an embedded
+//     README marks that package dirty instead.
+func nonBehavioral(path string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+		if seg == "testdata" || seg == "fixtures" || seg == "golden" {
+			return false
+		}
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".md", ".markdown", ".rst", ".txt2", ".png", ".jpg", ".jpeg", ".gif",
+		".svg", ".ico", ".webp", ".pdf":
+		return true
+	}
+	switch filepath.Base(path) {
+	case "LICENSE", "NOTICE", "AUTHORS", "CONTRIBUTORS", "CODEOWNERS",
+		".gitignore", ".gitattributes", ".editorconfig":
+		return true
+	}
+	return false
 }
 
 // Options controls Select.
@@ -51,6 +86,9 @@ type Options struct {
 	// ConservativeOnUnresolved escalates to a full run when the diff touches a
 	// file outside the loaded package graph.
 	ConservativeOnUnresolved bool
+	// IncludeNonBehavioral disables the documentation/asset filter, so every
+	// unresolved file escalates. Use it to audit what the filter is skipping.
+	IncludeNonBehavioral bool
 }
 
 // Select maps hunks to symbols and symbols to tests.
@@ -60,11 +98,16 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	changed := make(map[string]bool)
 	dirtyPkgs := make(map[string]bool)
 	unresolved := make(map[string]bool)
+	ignored := make(map[string]bool)
 
 	for _, h := range hunks {
 		spans, known := g.Spans[h.File]
 		pkg, inPkg := g.FilePkg[h.File]
 		if !known && !inPkg {
+			if !opts.IncludeNonBehavioral && nonBehavioral(h.File) {
+				ignored[h.File] = true
+				continue
+			}
 			unresolved[h.File] = true
 			continue
 		}
@@ -85,6 +128,7 @@ func Select(g *graph.Graph, hunks []gitdiff.Hunk, opts Options) *Result {
 	res.ChangedSymbols = sortedKeys(changed)
 	res.DirtyPackages = sortedKeys(dirtyPkgs)
 	res.UnresolvedFiles = sortedKeys(unresolved)
+	res.IgnoredFiles = sortedKeys(ignored)
 
 	if opts.Conservative || (opts.ConservativeOnUnresolved && len(unresolved) > 0) {
 		res.Conservative = true

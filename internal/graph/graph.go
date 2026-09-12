@@ -16,8 +16,10 @@ import (
 	"go/types"
 	"strings"
 
+	"github.com/BlackBuck/whichtests/internal/fsutil"
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/callgraph/rta"
+	"golang.org/x/tools/go/callgraph/vta"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
@@ -39,6 +41,9 @@ type FuncSpan struct {
 	PkgPath   string
 	StartLine int
 	EndLine   int
+	// BodyOffset is the byte offset just past the body's opening brace, or 0
+	// for a function with no body. Fault injection splices a panic in there.
+	BodyOffset int
 }
 
 // Graph is the result of a single analysis pass over the module.
@@ -57,6 +62,12 @@ type Graph struct {
 
 	// LoadErrors counts packages that failed to type-check.
 	LoadErrors int
+
+	// indexed guards against double-indexing a file. With Tests:true a package
+	// is loaded several times over (itself, the internal test variant, the
+	// external test package), and every variant carries the same syntax for the
+	// non-test files, so an unguarded append duplicates every span.
+	indexed map[string]bool
 }
 
 // Config controls a Build.
@@ -78,7 +89,8 @@ func Build(cfg Config) (*Graph, error) {
 		Tests: true,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedDeps | packages.NeedTypes |
-			packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedModule,
+			packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedModule |
+			packages.NeedEmbedFiles,
 	}
 	pkgs, err := packages.Load(pcfg, patterns...)
 	if err != nil {
@@ -92,6 +104,7 @@ func Build(cfg Config) (*Graph, error) {
 		Spans:   make(map[string][]FuncSpan),
 		FilePkg: make(map[string]string),
 		PkgDeps: make(map[string]map[string]bool),
+		indexed: make(map[string]bool),
 	}
 	packages.Visit(pkgs, nil, func(p *packages.Package) {
 		g.LoadErrors += len(p.Errors)
@@ -105,6 +118,7 @@ func Build(cfg Config) (*Graph, error) {
 	var roots []*ssa.Function
 	initOf := make(map[*ssa.Package]*ssa.Function)
 	seen := make(map[*ssa.Function]bool)
+	inScope := make(map[*ssa.Package]bool)
 
 	for _, p := range pkgs {
 		if p.Types == nil {
@@ -114,6 +128,8 @@ func Build(cfg Config) (*Graph, error) {
 		if sp == nil {
 			continue
 		}
+		inScope[sp] = true
+		g.indexEmbeds(p)
 		g.indexSpans(p, prog)
 		g.indexDeps(p)
 
@@ -142,11 +158,124 @@ func Build(cfg Config) (*Graph, error) {
 		return g, nil
 	}
 
-	cg := rta.Analyze(roots, true).CallGraph
+	// One RTA pass covers every test, which is the only affordable option: a
+	// pass per test would be O(tests) full analyses. The price is that RTA's
+	// address-taken set is global, so `testing.tRunner`'s indirect `t.F()` call
+	// gets an edge to every func(*testing.T) in the program. Any test that
+	// calls t.Run then "reaches" every other test, and through them the whole
+	// module. Left alone, that makes every diff select 100% of the suite.
+	//
+	// Cutting edges into a *different* test's subgraph removes exactly that
+	// contamination while keeping a test's own subtest closures, which is where
+	// the work being measured actually happens.
+	// RTA first to bound the program to what the tests can reach, then VTA to
+	// refine it. RTA resolves an indirect call to every address-taken function
+	// with a matching signature, which makes ubiquitous `func()` call sites
+	// (sync.Once.Do, defer wrappers) global hubs: on cli/cli a two-symbol diff
+	// selected all 1704 tests because one closure inside the changed function
+	// was linked from every init in the standard library. VTA tracks which
+	// function values actually flow to a call site, which collapses those hubs.
+	rtaRes := rta.Analyze(roots, true)
+	reachable := make(map[*ssa.Function]bool, len(rtaRes.Reachable))
+	for fn := range rtaRes.Reachable {
+		reachable[fn] = true
+	}
+	r := &reacher{
+		cg:      vta.CallGraph(reachable, rtaRes.CallGraph),
+		tests:   make(map[*ssa.Function]bool, len(g.Tests)),
+		inScope: inScope,
+		path:    make(map[*ssa.Package]string),
+	}
 	for _, t := range g.Tests {
-		t.Reach = reachable(cg, t.Fn, initOf[t.Fn.Pkg])
+		r.tests[t.Fn] = true
+	}
+	for _, t := range g.Tests {
+		// A test can only reach packages its own test binary imports. Any edge
+		// outside that closure is provably false, whatever the call graph says,
+		// so this filter is sound by construction and cheap.
+		allowed := g.PkgDeps[t.PkgPath]
+		t.Reach = r.reachable(t.Fn, allowed, t.PkgPath, initOf[t.Fn.Pkg])
 	}
 	return g, nil
+}
+
+type reacher struct {
+	cg    *callgraph.Graph
+	tests map[*ssa.Function]bool
+	// inScope holds the packages a diff can actually touch. Traversal still
+	// walks through the standard library, but recording those keys would store
+	// ~3k entries per test for symbols no diff of this module can ever name.
+	inScope map[*ssa.Package]bool
+	// path caches import paths so the per-function closure check stays cheap.
+	path map[*ssa.Package]string
+}
+
+func (r *reacher) pkgPath(p *ssa.Package) string {
+	if p == nil {
+		return ""
+	}
+	if v, ok := r.path[p]; ok {
+		return v
+	}
+	v := ""
+	if p.Pkg != nil {
+		v = runPath(p.Pkg.Path())
+	}
+	r.path[p] = v
+	return v
+}
+
+// owner returns the test entry point a function belongs to (itself, or the
+// test it is a closure inside), or nil if it belongs to no test.
+func (r *reacher) owner(fn *ssa.Function) *ssa.Function {
+	for fn.Parent() != nil {
+		fn = fn.Parent()
+	}
+	if r.tests[fn] {
+		return fn
+	}
+	return nil
+}
+
+// reachable walks the call graph from a test entry point. The package init is
+// seeded alongside it because package-level state is built before the test
+// runs, so a change there does affect the test.
+func (r *reacher) reachable(self *ssa.Function, allowed map[string]bool, own string, also ...*ssa.Function) map[string]bool {
+	out := make(map[string]bool)
+	visited := make(map[*ssa.Function]bool)
+	queue := []*ssa.Function{self}
+	for _, s := range also {
+		if s != nil {
+			queue = append(queue, s)
+		}
+	}
+	for len(queue) > 0 {
+		fn := queue[0]
+		queue = queue[1:]
+		if fn == nil || visited[fn] {
+			continue
+		}
+		visited[fn] = true
+		if p := pkgOf(fn); r.inScope[p] {
+			if path := r.pkgPath(p); path == own || allowed[path] {
+				out[Key(fn)] = true
+			}
+		}
+		n := r.cg.Nodes[fn]
+		if n == nil {
+			continue
+		}
+		for _, e := range n.Out {
+			if e.Callee == nil || e.Callee.Func == nil {
+				continue
+			}
+			if o := r.owner(e.Callee.Func); o != nil && o != self {
+				continue
+			}
+			queue = append(queue, e.Callee.Func)
+		}
+	}
+	return out
 }
 
 // Key is the canonical identity of a symbol, shared by the call-graph side and
@@ -159,6 +288,16 @@ func Build(cfg Config) (*Graph, error) {
 //     graph side has to agree or the two never match.
 //   - Generic instantiations collapse into their origin, so editing the body
 //     of Map[T] matches a test that only ever reaches Map[int].
+//
+// pkgOf returns the package a function belongs to, following closures out to
+// their enclosing declaration.
+func pkgOf(fn *ssa.Function) *ssa.Package {
+	for fn.Parent() != nil {
+		fn = fn.Parent()
+	}
+	return fn.Pkg
+}
+
 func Key(fn *ssa.Function) string {
 	if fn == nil {
 		return ""
@@ -175,36 +314,6 @@ func Key(fn *ssa.Function) string {
 	return fn.String()
 }
 
-func reachable(cg *callgraph.Graph, seeds ...*ssa.Function) map[string]bool {
-	out := make(map[string]bool)
-	visited := make(map[*ssa.Function]bool)
-	var queue []*ssa.Function
-	for _, s := range seeds {
-		if s != nil {
-			queue = append(queue, s)
-		}
-	}
-	for len(queue) > 0 {
-		fn := queue[0]
-		queue = queue[1:]
-		if fn == nil || visited[fn] {
-			continue
-		}
-		visited[fn] = true
-		out[Key(fn)] = true
-		n := cg.Nodes[fn]
-		if n == nil {
-			continue
-		}
-		for _, e := range n.Out {
-			if e.Callee != nil {
-				queue = append(queue, e.Callee.Func)
-			}
-		}
-	}
-	return out
-}
-
 // indexSpans records the line range of every top-level FuncDecl in the package,
 // keyed the same way the call graph keys it. Resolving the *types.Func through
 // prog.FuncValue avoids reconstructing ssa's naming scheme by hand.
@@ -214,7 +323,12 @@ func (g *Graph) indexSpans(p *packages.Package, prog *ssa.Program) {
 		if pos.Filename == "" {
 			continue
 		}
-		g.FilePkg[pos.Filename] = runPath(p.PkgPath)
+		canon := fsutil.Canon(pos.Filename)
+		g.FilePkg[canon] = runPath(p.PkgPath)
+		if g.indexed[canon] {
+			continue
+		}
+		g.indexed[canon] = true
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
 			if !ok {
@@ -230,13 +344,30 @@ func (g *Graph) indexSpans(p *packages.Package, prog *ssa.Program) {
 			}
 			start := prog.Fset.Position(fd.Pos())
 			end := prog.Fset.Position(fd.End())
-			g.Spans[start.Filename] = append(g.Spans[start.Filename], FuncSpan{
-				Key:       Key(fn),
-				PkgPath:   runPath(p.PkgPath),
-				StartLine: start.Line,
-				EndLine:   end.Line,
+			file := fsutil.Canon(start.Filename)
+			var bodyOffset int
+			if fd.Body != nil {
+				bodyOffset = prog.Fset.Position(fd.Body.Lbrace).Offset + 1
+			}
+			g.Spans[file] = append(g.Spans[file], FuncSpan{
+				Key:        Key(fn),
+				PkgPath:    runPath(p.PkgPath),
+				StartLine:  start.Line,
+				EndLine:    end.Line,
+				BodyOffset: bodyOffset,
 			})
 		}
+	}
+}
+
+// indexEmbeds attributes //go:embed targets to the package that embeds them.
+// A change to an embedded file really does change what the package does, so it
+// must mark that package dirty rather than falling through to the unresolved
+// path — and it stops the non-behavioral file filter from ignoring an embedded
+// .md or image.
+func (g *Graph) indexEmbeds(p *packages.Package) {
+	for _, f := range p.EmbedFiles {
+		g.FilePkg[fsutil.Canon(f)] = runPath(p.PkgPath)
 	}
 }
 

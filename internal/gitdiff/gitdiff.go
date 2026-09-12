@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/BlackBuck/whichtests/internal/fsutil"
 )
 
 // Hunk is a contiguous changed line range in a file, expressed in new-side
@@ -40,7 +42,7 @@ func Changed(dir, base string) ([]Hunk, error) {
 	if err != nil {
 		return nil, fmt.Errorf("git rev-parse: %w", err)
 	}
-	return parse(strings.TrimSpace(root), out)
+	return parse(fsutil.Canon(strings.TrimSpace(root)), out)
 }
 
 func parse(root, diff string) ([]Hunk, error) {
@@ -57,7 +59,7 @@ func parse(root, diff string) ([]Hunk, error) {
 				file = ""
 				continue
 			}
-			file = filepath.Join(root, strings.TrimPrefix(p, "b/"))
+			file = fsutil.Canon(filepath.Join(root, strings.TrimPrefix(p, "b/")))
 		case strings.HasPrefix(line, "@@ "):
 			if file == "" {
 				continue

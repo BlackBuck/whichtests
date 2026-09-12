@@ -32,6 +32,7 @@ func run() error {
 		conservative = flag.Bool("conservative", false, "select every test regardless of the diff")
 		safe         = flag.Bool("safe", true, "fall back to every test when the diff touches files outside the package graph")
 		explain      = flag.Bool("explain", false, "show why each test was selected")
+		includeND    = flag.Bool("include-non-behavioral", false, "escalate on docs and assets too, instead of ignoring them")
 	)
 	flag.Parse()
 
@@ -52,6 +53,7 @@ func run() error {
 	res := selection.Select(g, hunks, selection.Options{
 		Conservative:             *conservative,
 		ConservativeOnUnresolved: *safe,
+		IncludeNonBehavioral:     *includeND,
 	})
 
 	switch *format {
@@ -91,6 +93,9 @@ func emitText(r *selection.Result, explain bool, took time.Duration) error {
 		len(r.ChangedSymbols), len(r.DirtyPackages))
 	if r.Conservative {
 		fmt.Println("selection was conservative: every test was included")
+	}
+	if len(r.IgnoredFiles) > 0 {
+		fmt.Printf("%d changed file(s) ignored as non-behavioral (docs, assets)\n", len(r.IgnoredFiles))
 	}
 	if len(r.UnresolvedFiles) > 0 {
 		fmt.Printf("%d changed file(s) outside the package graph:\n", len(r.UnresolvedFiles))
