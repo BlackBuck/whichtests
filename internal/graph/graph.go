@@ -128,6 +128,12 @@ type Config struct {
 	// module's sources and build configuration. Leave it off when the caller
 	// rewrites source between builds, as the fault injector does.
 	Cache bool
+	// Tags are build tags to load with. Without them a tag-gated package is
+	// neither analysed nor selectable, so a change to it selects nothing --
+	// correct for the suite being selected from, and useless if you meant to
+	// cover those tests. Whatever you pass here must match the tags the test
+	// command will run with.
+	Tags []string
 }
 
 // Build loads the module, constructs the call graph, and computes per-test
@@ -142,7 +148,7 @@ func Build(cfg Config) (*Graph, error) {
 	if cfg.Cache {
 		// A cache failure must never be an analysis failure, so every error
 		// here falls through to a normal build.
-		if k, err := CacheKey(cfg.Dir, patterns); err == nil {
+		if k, err := CacheKey(cfg.Dir, append(append([]string{}, patterns...), tagKey(cfg.Tags))); err == nil {
 			cacheKey = k
 			if g, ok := LoadCached(k); ok {
 				g.CacheHit = true
@@ -152,8 +158,9 @@ func Build(cfg Config) (*Graph, error) {
 	}
 
 	pcfg := &packages.Config{
-		Dir:   cfg.Dir,
-		Tests: true,
+		Dir:        cfg.Dir,
+		Tests:      true,
+		BuildFlags: buildFlags(cfg.Tags),
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedDeps | packages.NeedTypes |
 			packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedModule |
@@ -477,6 +484,25 @@ func packagePathOf(fn *ssa.Function) string {
 		}
 	}
 	return ""
+}
+
+// buildFlags turns build tags into the flag go/packages passes to the toolchain.
+func buildFlags(tags []string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	return []string{"-tags=" + strings.Join(tags, ",")}
+}
+
+// tagKey folds build tags into the cache key. Loading with a different tag set
+// produces a different package graph, so it must not share a cached snapshot.
+func tagKey(tags []string) string {
+	if len(tags) == 0 {
+		return "tags:"
+	}
+	t := append([]string{}, tags...)
+	sort.Strings(t)
+	return "tags:" + strings.Join(t, ",")
 }
 
 func pathOf(p *ssa.Package) string {

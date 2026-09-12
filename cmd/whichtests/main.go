@@ -43,11 +43,14 @@ func run() error {
 		explain      = flag.Bool("explain", false, "show why each test was selected")
 		includeND    = flag.Bool("include-non-behavioral", false, "escalate on docs and assets too, instead of ignoring them")
 		cache        = flag.Bool("cache", true, "reuse an on-disk graph when the module's sources are unchanged")
+		tags         = flag.String("tags", "", "comma-separated build tags; must match the tags the tests will run with")
 	)
 	flag.Parse()
 
 	started := time.Now()
-	g, err := graph.Build(graph.Config{Dir: *dir, Patterns: flag.Args(), Cache: *cache})
+	g, err := graph.Build(graph.Config{
+		Dir: *dir, Patterns: flag.Args(), Cache: *cache, Tags: splitTags(*tags),
+	})
 	if err != nil {
 		return err
 	}
@@ -131,6 +134,21 @@ func emitText(r *selection.Result, explain bool, took time.Duration) error {
 		}
 	}
 	return nil
+}
+
+// splitTags parses a comma-separated -tags value.
+func splitTags(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // truncList keeps a summary line short without hiding the count.

@@ -142,10 +142,11 @@ matters.
 - **`go:linkname`** is invisible and has no fallback.
 - **Deleted functions** have no new-side span, so they fall through to the
   package-level path. Sound, but coarse.
-- **Build tags.** Only the default configuration is loaded, so a change behind
-  another tag selects nothing: commit `9b6585be` rewrites 845 lines of a
-  build-tagged `acceptance_test.go` and whichtests reports 4 tests. Correct for
-  the suite being selected from, useless if you expected those covered.
+- **Build tags** must be passed explicitly, and must match what the tests will
+  run with. Without `-tags`, a tag-gated package is neither analysed nor
+  selectable, so a change to it selects nothing: commit `9b6585be` rewrites 845
+  lines of a build-tagged `acceptance_test.go` and reports 4 of 1704 tests.
+  With `-tags acceptance` it reports 31 of 1731, acceptance tests included.
 - **Subtests.** Selection is per top-level `Test`. Table-driven cases share a
   reach set, so static analysis cannot separate them at all.
 - **Cross-module changes.** Only the module under analysis is diffed.
@@ -164,6 +165,7 @@ whichtests [flags] [packages]
   -cache           reuse an on-disk graph when sources are unchanged (default true)
   -safe            run everything when the diff touches unrecognised files (default true)
   -conservative    run everything, unconditionally
+  -tags string     comma-separated build tags; must match the tags the tests run with
   -include-non-behavioral
                    escalate on docs and assets too, to audit what is skipped
 
@@ -262,7 +264,7 @@ so a moved checkout must miss. 18MB for cli/cli. `-cache=false` disables it,
 
 ## Roadmap
 
-- [ ] Load build-tag-gated packages
+- [x] Load build-tag-gated packages via `-tags`
 - [ ] Subtest granularity for non-table-driven `t.Run`
 - [x] `whichtests doctor`: report a repo's ceiling before anyone wires it in
 - [ ] GitHub Action wrapper

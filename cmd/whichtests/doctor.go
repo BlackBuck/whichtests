@@ -21,11 +21,14 @@ func doctor(args []string) error {
 	dir := fs.String("C", ".", "module directory to analyze")
 	cache := fs.Bool("cache", true, "reuse an on-disk graph when the module's sources are unchanged")
 	fat := fs.Int("fat", 20, "tests per package above which a package has real headroom")
+	tags := fs.String("tags", "", "comma-separated build tags")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	g, err := graph.Build(graph.Config{Dir: *dir, Patterns: fs.Args(), Cache: *cache})
+	g, err := graph.Build(graph.Config{
+		Dir: *dir, Patterns: fs.Args(), Cache: *cache, Tags: splitTags(*tags),
+	})
 	if err != nil {
 		return err
 	}

@@ -145,3 +145,44 @@ func TestCacheKeyIncludesLocation(t *testing.T) {
 		t.Error("identical sources in different directories must not share a key")
 	}
 }
+
+func TestTagsAffectBuildAndCacheKey(t *testing.T) {
+	if got := buildFlags(nil); got != nil {
+		t.Errorf("buildFlags(nil) = %v, want nil", got)
+	}
+	if got := buildFlags([]string{"acceptance", "integration"}); len(got) != 1 ||
+		got[0] != "-tags=acceptance,integration" {
+		t.Errorf("buildFlags = %v", got)
+	}
+
+	// Tag order must not matter, but the tag set must: loading with a
+	// different set produces a different package graph, so the two cannot
+	// share a cached snapshot.
+	if tagKey([]string{"b", "a"}) != tagKey([]string{"a", "b"}) {
+		t.Error("tagKey is order-sensitive")
+	}
+	if tagKey(nil) == tagKey([]string{"acceptance"}) {
+		t.Error("tagged and untagged builds share a cache key")
+	}
+
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"go.mod": "module m\n\ngo 1.24\n",
+		"a.go":   "package m\n\nfunc A() {}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plain, err := CacheKey(dir, []string{"./...", tagKey(nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagged, err := CacheKey(dir, []string{"./...", tagKey([]string{"acceptance"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain == tagged {
+		t.Error("cache key ignores build tags")
+	}
+}
