@@ -34,6 +34,73 @@ whichtests is built around the two places the build cache doesn't help:
 2. **Cold CI runners.** A fresh container has no build cache at all, so *nothing*
    is skipped, no matter how small the diff.
 
+Both are real. Neither is worth much on most Go repositories. Read the next
+section before adopting this.
+
+## When this is worth using
+
+Measured, not assumed. On a real cli/cli commit ([9174ffb0], which changes one
+function plus its tests), with the test cache cleared and warmed at the parent
+commit:
+
+| | Tests run |
+|---|---|
+| plain `go test ./...`, warm cache | **21** (4 packages) |
+| whichtests | **22** |
+
+It selected *more* than doing nothing clever. That result is structural, not a
+bug.
+
+**Go's test cache is keyed on the compiled test binary, not on the source.** It
+is already package-level test impact analysis, and it is strictly smarter than
+the source-diff kind: a comment change, or any refactor that compiles to an
+identical binary, re-runs nothing at all. No diff-based tool can match that.
+(Verifying the table above took two attempts for exactly this reason — the first
+probe inserted `_ = 4242`, the compiler eliminated it, the binary came back
+byte-identical, and `go test` correctly reported every package cached.)
+
+So the only headroom left is selecting *within* a changed package. Whether that
+is worth anything depends entirely on one number:
+
+```console
+$ for d in $(find . -name '*_test.go' | xargs -n1 dirname | sort -u); do \
+    grep -hcE '^func (Test|Benchmark|Fuzz)[A-Z_]' $d/*_test.go; \
+  done | sort -n | awk '{a[NR]=$1; s+=$1} END {print "packages:",NR,
+      " mean:",s/NR," median:",a[int(NR/2)]," p90:",a[int(NR*0.9)]," max:",a[NR]}'
+```
+
+On cli/cli:
+
+```
+packages: 250   mean: 7   median: 4   p90: 15   max: 82
+```
+
+**The median package has 4 tests.** There is nothing to skip, which is exactly
+what 21-vs-22 shows. Go's conventions push toward many small packages, so most
+Go repositories look like this.
+
+### Use it when
+
+- **Your packages are fat.** cli/cli's `./api` has 82 tests, `internal/config`
+  78, `pkg/cmd/extension` 60. A localized change in one of those makes `go test`
+  re-run all of them; whichtests picks a handful. A genuine 10-20x — on 3% of
+  the packages.
+- **Your suite is slow.** Value is (suite runtime) x (fraction skipped). cli/cli
+  runs in minutes, so even perfect selection saves little wall clock. A
+  45-minute integration suite is a different proposition.
+- **Your CI has no warm cache** — all 1714 tests run against whichtests' 22.
+  But the honest competitor here is persisting `GOCACHE` between CI runs: a few
+  lines of YAML, zero soundness risk, and it buys the package-level win for
+  free. Try that first.
+
+### Don't use it when
+
+Your repository looks like cli/cli: many small packages, a fast suite, and a CI
+cache you could just persist. 20 seconds of analysis to select 22 tests where
+`go test` already ran 21 for free is a bad trade.
+
+[9174ffb0]: https://github.com/cli/cli/commit/9174ffb0
+
 ## How it works
 
 1. **Load** the module with `go/packages` (`Tests: true`) and build SSA.
@@ -326,6 +393,11 @@ for RTA on every commit, and the map only changes when the call graph does.
 - [x] Ignore documentation and assets instead of escalating on them
 - [ ] Load build-tag-gated packages (`acceptance/` caused 3 of 25 escalations)
 - [ ] Narrow `go.mod`/`go.sum` escalation using the changed modules' reverse deps
+- [ ] Reverse the traversal: walk `callgraph.Node.In` from the changed symbols
+      instead of building a reach set per test. The forward BFS is 16.5s of a
+      20.8s cli/cli run, and it builds 1714 sets to answer a 2-symbol query.
+- [ ] `whichtests doctor`: report the tests-per-package distribution so someone
+      can tell in 30 seconds whether this repository has any headroom
 - [x] Fault injection (`whichtests-mutate`) to measure recall without waiting
       for history to break
 - [ ] Cache the reachability map keyed by build ID, so CI pays for RTA once
